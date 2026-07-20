@@ -94,10 +94,10 @@ def flush_loop():
         flush_accumulator()
 
 def parse_nethogs():
-    cmd = ["nethogs", "-t"]
-    print("Starting nethogs trace process...", flush=True)
+    cmd = ["nethogs", "-a", "-t"]
+    print("Starting nethogs trace process (all interfaces enabled)...", flush=True)
     try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
     except FileNotFoundError:
         print("Error: nethogs command not found. Please install nethogs (e.g. sudo apt install nethogs).", file=sys.stderr, flush=True)
         sys.exit(1)
@@ -105,7 +105,7 @@ def parse_nethogs():
         print(f"Error starting nethogs: {e}", file=sys.stderr, flush=True)
         sys.exit(1)
 
-    print("nethogs process started. Monitoring...", flush=True)
+    print("nethogs process started. Monitoring all interfaces...", flush=True)
 
     while not stop_event.is_set():
         line = proc.stdout.readline()
@@ -118,7 +118,7 @@ def parse_nethogs():
                     time.sleep(0.5)
                 if not stop_event.is_set():
                     try:
-                        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
+                        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
                         continue
                     except Exception as e:
                         print(f"Failed to restart nethogs: {e}", file=sys.stderr, flush=True)
@@ -144,12 +144,23 @@ def parse_nethogs():
         subparts = prog_pid_uid.rsplit('/', 2)
         if len(subparts) == 3:
             program = subparts[0]
+            pid = subparts[1]
         else:
             program = prog_pid_uid
+            pid = None
         
-        # Normalize unknown programs or clean up paths
-        if not program or program == "unknown TCP" or program == "unknown UDP":
-            program = "System / Unknown"
+        # Normalize unknown programs, connection strings, or clean up paths
+        if not program or program in ("unknown TCP", "unknown UDP") or pid == "0":
+            if program and ("127.0.0.1" in program or "::1" in program or "localhost" in program):
+                program = "Local Loopback / Unassociated"
+            else:
+                program = "System / Unknown"
+        elif "-" in program and ":" in program:
+            # Check for connection string format (e.g. IP:port-IP:port)
+            if "127.0.0.1" in program or "::1" in program or "localhost" in program:
+                program = "Local Loopback / Unassociated"
+            else:
+                program = "System / Unknown"
 
         if sent_kb == 0.0 and recv_kb == 0.0:
             continue

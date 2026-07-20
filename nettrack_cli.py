@@ -469,52 +469,55 @@ class WebDashboardHandler(BaseHTTPRequestHandler):
                 const txData = data.trend.map(t => t.sent);
 
                 if (chart) {
-                    chart.destroy();
-                }
-
-                const ctx = document.getElementById('trendChart').getContext('2d');
-                chart = new Chart(ctx, {
-                    type: 'bar',
-                    data: {
-                        labels: labels,
-                        datasets: [
-                            {
-                                label: 'Download',
-                                data: rxData,
-                                backgroundColor: '#3b82f6',
-                                borderRadius: 4
-                            },
-                            {
-                                label: 'Upload',
-                                data: txData,
-                                backgroundColor: '#10b981',
-                                borderRadius: 4
-                            }
-                        ]
-                    },
-                    options: {
-                        responsive: true,
-                        maintainAspectRatio: false,
-                        plugins: {
-                            legend: {
-                                labels: { color: '#f8fafc' }
-                            }
+                    chart.data.labels = labels;
+                    chart.data.datasets[0].data = rxData;
+                    chart.data.datasets[1].data = txData;
+                    chart.update('none'); // Update without animation/flashing
+                } else {
+                    const ctx = document.getElementById('trendChart').getContext('2d');
+                    chart = new Chart(ctx, {
+                        type: 'bar',
+                        data: {
+                            labels: labels,
+                            datasets: [
+                                {
+                                    label: 'Download',
+                                    data: rxData,
+                                    backgroundColor: '#3b82f6',
+                                    borderRadius: 4
+                                },
+                                {
+                                    label: 'Upload',
+                                    data: txData,
+                                    backgroundColor: '#10b981',
+                                    borderRadius: 4
+                                }
+                            ]
                         },
-                        scales: {
-                            x: {
-                                grid: { color: 'rgba(255, 255, 255, 0.05)' },
-                                ticks: { color: '#94a3b8' }
+                        options: {
+                            responsive: true,
+                            maintainAspectRatio: false,
+                            plugins: {
+                                legend: {
+                                    labels: { color: '#f8fafc' }
+                                }
                             },
-                            y: {
-                                grid: { color: 'rgba(255, 255, 255, 0.05)' },
-                                ticks: {
-                                    color: '#94a3b8',
-                                    callback: function(value) { return formatBytes(value); }
+                            scales: {
+                                x: {
+                                    grid: { color: 'rgba(255, 255, 255, 0.05)' },
+                                    ticks: { color: '#94a3b8' }
+                                },
+                                y: {
+                                    grid: { color: 'rgba(255, 255, 255, 0.05)' },
+                                    ticks: {
+                                        color: '#94a3b8',
+                                        callback: function(value) { return formatBytes(value); }
+                                    }
                                 }
                             }
                         }
-                    }
-                });
+                    });
+                }
             } else {
                 if (chart) {
                     chart.destroy();
@@ -566,6 +569,90 @@ def run_web_server(port):
     except Exception as e:
         print(f"Error starting web server: {e}", file=sys.stderr)
 
+def run_live_dashboard(initial_period):
+    check_db()
+    
+    current_period = initial_period
+    
+    import select
+    import tty
+    import termios
+    import time
+    
+    class RawTerminal:
+        def __enter__(self):
+            self.enabled = False
+            try:
+                self.old_settings = termios.tcgetattr(sys.stdin)
+                tty.setcbreak(sys.stdin.fileno())
+                # Switch to alternate screen buffer and hide cursor
+                sys.stdout.write("\033[?1049h\033[?25l")
+                sys.stdout.flush()
+                self.enabled = True
+            except termios.error:
+                pass
+            return self
+
+        def __exit__(self, type, value, traceback):
+            if self.enabled:
+                # Switch back to normal screen buffer and show cursor
+                sys.stdout.write("\033[?1049l\033[?25h")
+                sys.stdout.flush()
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self.old_settings)
+
+    try:
+        with RawTerminal():
+            while True:
+                # Move cursor to top-left (do not clear whole screen to avoid flashing)
+                sys.stdout.write("\033[H")
+                sys.stdout.flush()
+                
+                # Fetch stats
+                if current_period == "week":
+                    sent, recv, programs, trend, label = get_week()
+                elif current_period == "month":
+                    sent, recv, programs, trend, label = get_month()
+                else:
+                    sent, recv, programs, trend, label = get_today()
+                
+                # Print dashboard
+                print_dashboard(sent, recv, programs, trend, label)
+                
+                # Print footer/controls
+                now_str = datetime.datetime.now().strftime("%H:%M:%S")
+                print(f" Last Updated: {now_str} | Controls: [d/1] Today  [w/2] Week  [m/3] Month  [r] Refresh  [q] Quit")
+                
+                # Clear remainder of screen to remove any ghost characters
+                sys.stdout.write("\033[J")
+                sys.stdout.flush()
+                
+                # Wait for input (2 seconds timeout)
+                try:
+                    rlist, _, _ = select.select([sys.stdin], [], [], 2.0)
+                except (InterruptedError, OSError):
+                    # Handle window resize or signal interrupt
+                    continue
+                
+                if rlist:
+                    key = sys.stdin.read(1)
+                    if not key:
+                        # EOF on stdin (e.g. redirected input ended)
+                        # Sleep to prevent high CPU usage, then check again
+                        time.sleep(2.0)
+                        continue
+                    if key.lower() == 'q':
+                        break
+                    elif key in ('1', 'd', 'D'):
+                        current_period = "today"
+                    elif key in ('2', 'w', 'W'):
+                        current_period = "week"
+                    elif key in ('3', 'm', 'M'):
+                        current_period = "month"
+                    elif key in ('r', 'R'):
+                        pass # Loop will update immediately
+    except KeyboardInterrupt:
+        pass
+
 # --- Main CLI ---
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="NetTrack - CLI Network History Monitor")
@@ -574,6 +661,9 @@ if __name__ == "__main__":
     group.add_argument("-w", "--week", action="store_true", help="Show statistics for the last 7 days")
     group.add_argument("-m", "--month", action="store_true", help="Show statistics for the last 30 days")
     group.add_argument("--web", type=int, nargs='?', const=8080, help="Run local web server dashboard. Specify optional port (default: 8080)")
+    
+    parser.add_argument("-l", "--live", action="store_true", help="Stay active and update stats in real-time (default in interactive terminal)")
+    parser.add_argument("-o", "--once", action="store_true", help="Display stats once and exit (default when output is piped/redirected)")
     
     args = parser.parse_args()
     
@@ -584,11 +674,30 @@ if __name__ == "__main__":
     check_db()
     
     if args.week:
-        sent, recv, programs, trend, label = get_week()
+        initial_period = "week"
     elif args.month:
-        sent, recv, programs, trend, label = get_month()
+        initial_period = "month"
     else:
-        # Default is today
-        sent, recv, programs, trend, label = get_today()
+        initial_period = "today"
         
-    print_dashboard(sent, recv, programs, trend, label)
+    # Determine if we should run in live mode
+    is_live = False
+    if args.live:
+        is_live = True
+    elif args.once:
+        is_live = False
+    else:
+        # Default to live mode if both stdin and stdout are interactive TTYs
+        is_live = sys.stdout.isatty() and sys.stdin.isatty()
+        
+    if is_live:
+        run_live_dashboard(initial_period)
+    else:
+        if initial_period == "week":
+            sent, recv, programs, trend, label = get_week()
+        elif initial_period == "month":
+            sent, recv, programs, trend, label = get_month()
+        else:
+            sent, recv, programs, trend, label = get_today()
+        print_dashboard(sent, recv, programs, trend, label)
+
