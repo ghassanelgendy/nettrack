@@ -115,14 +115,57 @@ def get_month():
     
     return total_sent, total_recv, programs, trend, "Last 30 Days"
 
-def draw_chart(trend, period_type):
-    if not trend:
-        print("\nNo trend data available for this period.")
-        return
+def get_term_size():
+    import shutil
+    try:
+        cols, lines = shutil.get_terminal_size()
+        return cols, lines
+    except Exception:
+        return 80, 24
+
+def compute_layout(lines, trend_len, apps_len, is_live):
+    if not is_live:
+        return min(trend_len, 24), min(apps_len, 20)
         
+    if lines < 12:
+        return 0, 0
+        
+    # Standard terminal height adaptive routing
+    if lines < 20:
+        app_rows = max(0, lines - 13)
+        return 0, app_rows
+        
+    available = lines - 18
+    if available < 6:
+        app_rows = max(0, lines - 13)
+        return 0, app_rows
+        
+    chart_rows = min(trend_len, 5)
+    app_rows = available - chart_rows
+    
+    if app_rows > 10:
+        extra_chart = min(trend_len - chart_rows, 5)
+        if extra_chart > 0:
+            chart_rows += extra_chart
+            app_rows = available - chart_rows
+            
+    if app_rows < 3:
+        needed = 3 - app_rows
+        shrinkable = chart_rows - 3
+        if shrinkable >= needed:
+            chart_rows -= needed
+            app_rows += needed
+        else:
+            app_rows = max(0, lines - 13)
+            chart_rows = 0
+            
+    return chart_rows, max(0, app_rows)
+
+def draw_chart_responsive(trend, period_type, width):
+    if not trend:
+        return
     labels = []
     values = []
-    
     for row in trend:
         if period_type == "Today":
             dt = datetime.datetime.fromtimestamp(row[0])
@@ -131,41 +174,76 @@ def draw_chart(trend, period_type):
             labels.append(row[0])
         values.append(row[1])
         
-    max_val = max(values)
+    max_val = max(values) if values else 0
     if max_val == 0:
         max_val = 1
         
-    max_bar_width = 30
-    print("\n" + "=" * 55)
-    print("                 TRAFFIC TREND CHART")
-    print("=" * 55)
+    print("-" * width)
+    print("TRAFFIC TREND CHART".center(width))
+    print("-" * width)
+    
+    max_bar_width = max(5, width - 26)
     for label, val in zip(labels, values):
         bar_len = int((val / max_val) * max_bar_width)
         bar = "█" * bar_len + "░" * (max_bar_width - bar_len)
         print(f" {label:<10} [{bar}] {format_bytes(val)}")
-    print("=" * 55)
+    print("-" * width)
 
-def print_dashboard(total_sent, total_recv, programs, trend, period_label):
-    print("=" * 75)
-    print(f"              NETTRACK NETWORK MONITOR - {period_label.upper()}")
-    print("=" * 75)
-    print(f" Downloaded : {format_bytes(total_recv):<20} Uploaded : {format_bytes(total_sent)}")
-    print(f" Total      : {format_bytes(total_recv + total_sent)}")
+def print_dashboard(total_sent, total_recv, programs, trend, period_label, is_live=False):
+    cols, lines = get_term_size()
+    width = max(40, min(cols - 2, 90))
     
-    draw_chart(trend, period_label)
+    chart_rows, app_rows = compute_layout(lines, len(trend), len(programs), is_live)
     
-    print("\n--- Top Applications ---")
-    print(f"  {'Rank':<5} {'Application':<33} {'Uploaded':>10} {'Downloaded':>10} {'Total':>10}")
-    print("-" * 75)
-    for idx, (program, sent, recv, total) in enumerate(programs[:20], 1):
-        display_name = program
-        if len(display_name) > 31:
-            display_name = "..." + display_name[-28:]
-        print(f"  {idx:<5} {display_name:<33} {format_bytes(sent):>10} {format_bytes(recv):>10} {format_bytes(total):>10}")
+    # Header
+    print("=" * width)
+    title = f"NETTRACK NETWORK MONITOR - {period_label.upper()}"
+    if len(title) > width:
+        title = f"NETTRACK - {period_label.upper()}"
+    if len(title) > width:
+        title = "NETTRACK"
+    print(title.center(width))
+    print("=" * width)
     
-    if len(programs) > 20:
-        print(f"  ... and {len(programs) - 20} more applications.")
-    print("=" * 75)
+    # Stats
+    if width >= 60:
+        print(f" Downloaded : {format_bytes(total_recv):<18} Uploaded : {format_bytes(total_sent)}")
+        print(f" Total      : {format_bytes(total_recv + total_sent)}")
+    else:
+        print(f" Down: {format_bytes(total_recv):<10} Up: {format_bytes(total_sent)}")
+        print(f" Total: {format_bytes(total_recv + total_sent)}")
+        
+    # Chart
+    if chart_rows > 0:
+        print("")  # Spacer
+        trend_slice = trend[-chart_rows:] if len(trend) > chart_rows else trend
+        draw_chart_responsive(trend_slice, period_label, width)
+        
+    # Apps
+    if app_rows > 0:
+        print("")  # Spacer
+        print(f"TOP APPLICATIONS ({period_label.upper()})".center(width))
+        print("-" * width)
+        
+        if width >= 55:
+            app_width = width - 43
+            print(f"  {'Rank':<4} {'Application':<{app_width}} {'Uploaded':>10} {'Downloaded':>10} {'Total':>10}")
+            print("-" * width)
+            for idx, (program, sent, recv, total) in enumerate(programs[:app_rows], 1):
+                display_name = program
+                if len(display_name) > app_width:
+                    display_name = "..." + display_name[-(app_width - 3):]
+                print(f"  {idx:<4} {display_name:<{app_width}} {format_bytes(sent):>10} {format_bytes(recv):>10} {format_bytes(total):>10}")
+        else:
+            app_width = width - 19
+            print(f"  {'Rank':<4} {'Application':<{app_width}} {'Total':>10}")
+            print("-" * width)
+            for idx, (program, sent, recv, total) in enumerate(programs[:app_rows], 1):
+                display_name = program
+                if len(display_name) > app_width:
+                    display_name = "..." + display_name[-(app_width - 3):]
+                print(f"  {idx:<4} {display_name:<{app_width}} {format_bytes(total):>10}")
+    print("=" * width)
 
 # --- Web Server Component ---
 class WebDashboardHandler(BaseHTTPRequestHandler):
@@ -242,17 +320,18 @@ class WebDashboardHandler(BaseHTTPRequestHandler):
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>NetTrack - Network Usage Dashboard</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <style>
         :root {
-            --bg-color: #0f172a;
-            --card-bg: #1e293b;
-            --text-color: #f8fafc;
+            --bg-color: #0b0f19;
+            --card-bg: rgba(22, 30, 49, 0.7);
+            --text-color: #f1f5f9;
             --text-muted: #94a3b8;
             --primary: #3b82f6;
             --primary-light: #60a5fa;
             --accent: #10b981;
-            --border-color: #334155;
+            --border-color: rgba(255, 255, 255, 0.08);
+            --font-family: 'Outfit', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
         }
         * {
             box-sizing: border-box;
@@ -260,11 +339,12 @@ class WebDashboardHandler(BaseHTTPRequestHandler):
             padding: 0;
         }
         body {
-            font-family: 'Inter', sans-serif;
-            background-color: var(--bg-color);
+            font-family: var(--font-family);
+            background: radial-gradient(circle at top left, #111827, #0b0f19);
             color: var(--text-color);
             padding: 2rem;
             line-height: 1.5;
+            min-height: 100vh;
         }
         header {
             margin-bottom: 2rem;
@@ -272,31 +352,44 @@ class WebDashboardHandler(BaseHTTPRequestHandler):
             justify-content: space-between;
             align-items: center;
             border-bottom: 1px solid var(--border-color);
-            padding-bottom: 1rem;
+            padding-bottom: 1.5rem;
+            flex-wrap: wrap;
+            gap: 1.5rem;
+            animation: fadeIn 0.6s cubic-bezier(0.16, 1, 0.3, 1) both;
         }
         h1 {
-            font-size: 1.8rem;
+            font-size: 2rem;
             font-weight: 700;
-            color: #ffffff;
+            background: linear-gradient(to right, #ffffff, #94a3b8);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            letter-spacing: -0.02em;
         }
         .timeframe-selector {
             display: flex;
             gap: 0.5rem;
         }
         .btn {
-            background-color: var(--card-bg);
+            background-color: rgba(30, 41, 59, 0.5);
             border: 1px solid var(--border-color);
             color: var(--text-color);
-            padding: 0.5rem 1rem;
-            border-radius: 6px;
+            padding: 0.6rem 1.2rem;
+            border-radius: 8px;
             cursor: pointer;
             font-weight: 600;
             font-size: 0.875rem;
-            transition: all 0.2s;
+            transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
         }
-        .btn.active, .btn:hover {
-            background-color: var(--primary);
+        .btn:hover {
+            background-color: rgba(59, 130, 246, 0.1);
             border-color: var(--primary);
+            transform: translateY(-1px);
+        }
+        .btn.active {
+            background: linear-gradient(135deg, var(--primary), #2563eb);
+            border-color: var(--primary);
+            box-shadow: 0 4px 12px rgba(59, 130, 246, 0.3);
+            color: #ffffff;
         }
         .stats-grid {
             display: grid;
@@ -305,54 +398,79 @@ class WebDashboardHandler(BaseHTTPRequestHandler):
             margin-bottom: 2rem;
         }
         .card {
-            background-color: var(--card-bg);
+            background: var(--card-bg);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
             border: 1px solid var(--border-color);
-            border-radius: 12px;
+            border-radius: 16px;
             padding: 1.5rem;
-            box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);
+            box-shadow: 0 10px 30px -10px rgba(0,0,0,0.5);
+            transition: transform 0.3s ease, box-shadow 0.3s ease, border-color 0.3s ease;
+            animation: fadeIn 0.6s cubic-bezier(0.16, 1, 0.3, 1) both;
         }
+        .card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 15px 35px -5px rgba(0,0,0,0.6);
+            border-color: rgba(59, 130, 246, 0.3);
+        }
+        .stats-grid .card:nth-child(1) { animation-delay: 0.05s; }
+        .stats-grid .card:nth-child(2) { animation-delay: 0.1s; }
+        .stats-grid .card:nth-child(3) { animation-delay: 0.15s; }
+        
         .card-title {
             color: var(--text-muted);
-            font-size: 0.875rem;
-            font-weight: 600;
+            font-size: 0.75rem;
+            font-weight: 700;
             text-transform: uppercase;
-            letter-spacing: 0.05em;
-            margin-bottom: 0.5rem;
+            letter-spacing: 0.08em;
+            margin-bottom: 0.75rem;
         }
         .card-value {
-            font-size: 2rem;
+            font-size: 2.25rem;
             font-weight: 700;
             color: #ffffff;
+            letter-spacing: -0.03em;
         }
         .dashboard-layout {
             display: grid;
             grid-template-columns: 3fr 2fr;
             gap: 1.5rem;
         }
-        @media(max-width: 1024px) {
-            .dashboard-layout {
-                grid-template-columns: 1fr;
-            }
+        .dashboard-layout > .card:nth-child(1) { animation-delay: 0.2s; }
+        .dashboard-layout > .card:nth-child(2) { animation-delay: 0.25s; }
+        
+        h3 {
+            font-size: 1.25rem;
+            font-weight: 600;
+            color: #ffffff;
+            margin-bottom: 1.25rem;
+            letter-spacing: -0.01em;
         }
         .chart-container {
             position: relative;
-            height: 300px;
+            height: clamp(200px, 38vh, 360px);
             width: 100%;
         }
         .app-table {
             width: 100%;
             border-collapse: collapse;
-            margin-top: 1rem;
+            min-width: 400px;
         }
         .app-table th, .app-table td {
             text-align: left;
-            padding: 0.75rem 1rem;
-            border-bottom: 1px solid var(--border-color);
+            padding: 0.85rem 1rem;
+            border-bottom: 1px solid rgba(255,255,255,0.04);
         }
         .app-table th {
             color: var(--text-muted);
             font-weight: 600;
-            font-size: 0.875rem;
+            font-size: 0.8rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            border-bottom: 1px solid var(--border-color);
+        }
+        .app-table tr {
+            transition: background-color 0.2s ease;
         }
         .app-table tr:hover {
             background-color: rgba(255,255,255,0.02);
@@ -360,13 +478,86 @@ class WebDashboardHandler(BaseHTTPRequestHandler):
         .text-right {
             text-align: right;
         }
+        .app-name-cell {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            max-width: 100%;
+        }
+        .app-name {
+            font-weight: 600;
+            color: #f8fafc;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            max-width: 180px;
+        }
         .badge {
             display: inline-block;
-            padding: 0.25rem 0.5rem;
-            border-radius: 4px;
-            font-size: 0.75rem;
+            padding: 0.2rem 0.5rem;
+            border-radius: 6px;
+            font-size: 0.65rem;
             font-weight: 700;
-            background-color: var(--border-color);
+            letter-spacing: 0.05em;
+            text-transform: uppercase;
+            background-color: rgba(59, 130, 246, 0.12);
+            color: var(--primary-light);
+            border: 1px solid rgba(59, 130, 246, 0.2);
+        }
+        
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(12px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        
+        /* Media Queries for responsiveness */
+        @media(max-width: 1024px) {
+            .dashboard-layout {
+                grid-template-columns: 1fr;
+            }
+        }
+        @media (max-width: 640px) {
+            body {
+                padding: 1rem;
+            }
+            header {
+                flex-direction: column;
+                align-items: flex-start;
+                gap: 1rem;
+                padding-bottom: 1rem;
+            }
+            .timeframe-selector {
+                width: 100%;
+            }
+            .timeframe-selector .btn {
+                flex: 1;
+                text-align: center;
+                padding: 0.5rem;
+                font-size: 0.8rem;
+            }
+            .stats-grid {
+                grid-template-columns: 1fr;
+                gap: 1rem;
+            }
+            .card {
+                padding: 1.25rem;
+            }
+            .card-value {
+                font-size: 1.85rem;
+            }
+            .app-name {
+                max-width: 120px;
+            }
+        }
+        @media (min-width: 768px) {
+            .app-name {
+                max-width: 250px;
+            }
+        }
+        @media (min-width: 1200px) {
+            .app-name {
+                max-width: 380px;
+            }
         }
     </style>
 </head>
@@ -374,12 +565,12 @@ class WebDashboardHandler(BaseHTTPRequestHandler):
     <header>
         <div>
             <h1>NetTrack Network Dashboard</h1>
-            <p style="color: var(--text-muted); font-size: 0.875rem;">Real-time historical app network analyzer</p>
+            <p style="color: var(--text-muted); font-size: 0.875rem; margin-top: 0.25rem;">Real-time historical app network analyzer</p>
         </div>
         <div class="timeframe-selector">
-            <button class="btn active" onclick="switchTimeframe('today')">Today</button>
-            <button class="btn" onclick="switchTimeframe('week')">Last 7 Days</button>
-            <button class="btn" onclick="switchTimeframe('month')">Last 30 Days</button>
+            <button class="btn active" onclick="switchTimeframe('today', event)">Today</button>
+            <button class="btn" onclick="switchTimeframe('week', event)">Last 7 Days</button>
+            <button class="btn" onclick="switchTimeframe('month', event)">Last 30 Days</button>
         </div>
     </header>
 
@@ -400,13 +591,13 @@ class WebDashboardHandler(BaseHTTPRequestHandler):
 
     <div class="dashboard-layout">
         <div class="card">
-            <h3 style="margin-bottom: 1rem;">Traffic Trend</h3>
+            <h3>Traffic Trend</h3>
             <div class="chart-container">
                 <canvas id="trendChart"></canvas>
             </div>
         </div>
         <div class="card">
-            <h3 style="margin-bottom: 1rem;">Top Apps & Services</h3>
+            <h3>Top Apps & Services</h3>
             <div style="overflow-x: auto;">
                 <table class="app-table">
                     <thead>
@@ -449,15 +640,16 @@ class WebDashboardHandler(BaseHTTPRequestHandler):
             tbody.innerHTML = '';
             data.apps.forEach(app => {
                 const tr = document.createElement('tr');
-                let appName = app.name;
-                if (appName.length > 25) {
-                    appName = '...' + appName.substring(appName.length - 22);
-                }
                 tr.innerHTML = `
-                    <td title="${app.name}"><span class="badge">App</span> <strong>${appName}</strong></td>
+                    <td title="${app.name}">
+                        <div class="app-name-cell">
+                            <span class="badge">App</span>
+                            <span class="app-name">${app.name}</span>
+                        </div>
+                    </td>
                     <td class="text-right" style="color: var(--text-muted);">${formatBytes(app.sent)}</td>
                     <td class="text-right" style="color: var(--text-muted);">${formatBytes(app.recv)}</td>
-                    <td class="text-right" style="font-weight: 600;">${formatBytes(app.total)}</td>
+                    <td class="text-right" style="font-weight: 600; color: #ffffff;">${formatBytes(app.total)}</td>
                 `;
                 tbody.appendChild(tr);
             });
@@ -499,18 +691,19 @@ class WebDashboardHandler(BaseHTTPRequestHandler):
                             maintainAspectRatio: false,
                             plugins: {
                                 legend: {
-                                    labels: { color: '#f8fafc' }
+                                    labels: { color: '#f8fafc', font: { family: 'Outfit' } }
                                 }
                             },
                             scales: {
                                 x: {
                                     grid: { color: 'rgba(255, 255, 255, 0.05)' },
-                                    ticks: { color: '#94a3b8' }
+                                    ticks: { color: '#94a3b8', font: { family: 'Outfit' } }
                                 },
                                 y: {
                                     grid: { color: 'rgba(255, 255, 255, 0.05)' },
                                     ticks: {
                                         color: '#94a3b8',
+                                        font: { family: 'Outfit' },
                                         callback: function(value) { return formatBytes(value); }
                                     }
                                 }
@@ -526,12 +719,14 @@ class WebDashboardHandler(BaseHTTPRequestHandler):
             }
         }
 
-        function switchTimeframe(tf) {
+        function switchTimeframe(tf, event) {
             currentTimeframe = tf;
             document.querySelectorAll('.timeframe-selector .btn').forEach(btn => {
                 btn.classList.remove('active');
             });
-            event.target.classList.add('active');
+            if (event && event.target) {
+                event.target.classList.add('active');
+            }
             renderDashboard();
         }
 
@@ -601,11 +796,17 @@ def run_live_dashboard(initial_period):
                 termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self.old_settings)
 
     try:
+        last_cols, last_lines = None, None
         with RawTerminal():
             while True:
-                # Move cursor to top-left (do not clear whole screen to avoid flashing)
-                sys.stdout.write("\033[H")
-                sys.stdout.flush()
+                cols, lines = get_term_size()
+                if last_cols is None or (cols, lines) != (last_cols, last_lines):
+                    sys.stdout.write("\033[2J\033[H")
+                    sys.stdout.flush()
+                    last_cols, last_lines = cols, lines
+                else:
+                    sys.stdout.write("\033[H")
+                    sys.stdout.flush()
                 
                 # Fetch stats
                 if current_period == "week":
@@ -616,7 +817,7 @@ def run_live_dashboard(initial_period):
                     sent, recv, programs, trend, label = get_today()
                 
                 # Print dashboard
-                print_dashboard(sent, recv, programs, trend, label)
+                print_dashboard(sent, recv, programs, trend, label, is_live=True)
                 
                 # Print footer/controls
                 now_str = datetime.datetime.now().strftime("%H:%M:%S")
