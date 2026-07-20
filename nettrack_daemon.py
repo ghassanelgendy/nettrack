@@ -6,6 +6,7 @@ import time
 import sqlite3
 import threading
 import signal
+import re
 
 DB_DIR = "/var/lib/nettrack"
 DB_PATH = os.path.join(DB_DIR, "nettrack.db")
@@ -92,10 +93,39 @@ def flush_loop():
                 break
             time.sleep(0.5)
         flush_accumulator()
+def is_docker_pid(pid):
+    if not pid or pid == "0":
+        return False
+    try:
+        cgroup_path = f"/proc/{pid}/cgroup"
+        if os.path.exists(cgroup_path):
+            with open(cgroup_path, "r") as f:
+                content = f.read()
+                if "docker" in content or "containerd" in content or "sandbox" in content:
+                    return True
+    except:
+        pass
+    return False
+
+def is_docker_ip(prog_str):
+    if not prog_str:
+        return False
+    ips = re.findall(r'\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b', prog_str)
+    for ip in ips:
+        parts = ip.split('.')
+        if len(parts) == 4:
+            try:
+                first = int(parts[0])
+                second = int(parts[1])
+                if first == 172 and 16 <= second <= 31:
+                    return True
+            except ValueError:
+                pass
+    return False
 
 def parse_nethogs():
-    cmd = ["nethogs", "-a", "-t"]
-    print("Starting nethogs trace process (all interfaces enabled)...", flush=True)
+    cmd = ["nethogs", "-a", "-t", "-C"]
+    print("Starting nethogs trace process (all interfaces, TCP and UDP enabled)...", flush=True)
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
     except FileNotFoundError:
@@ -149,18 +179,50 @@ def parse_nethogs():
             program = prog_pid_uid
             pid = None
         
+        # Check if process is running inside Docker
+        is_docker = pid and is_docker_pid(pid)
+        
         # Normalize unknown programs, connection strings, or clean up paths
         if not program or program in ("unknown TCP", "unknown UDP") or pid == "0":
-            if program and ("127.0.0.1" in program or "::1" in program or "localhost" in program):
+            if program and is_docker_ip(program):
+                program = "[Docker] Container Traffic (Unmapped)"
+            elif program and ("127.0.0.1" in program or "::1" in program or "localhost" in program):
                 program = "Local Loopback / Unassociated"
             else:
                 program = "System / Unknown"
         elif "-" in program and ":" in program:
             # Check for connection string format (e.g. IP:port-IP:port)
-            if "127.0.0.1" in program or "::1" in program or "localhost" in program:
+            if is_docker_ip(program):
+                program = "[Docker] Container Traffic (Unmapped)"
+            elif "127.0.0.1" in program or "::1" in program or "localhost" in program:
                 program = "Local Loopback / Unassociated"
             else:
                 program = "System / Unknown"
+
+        # Apply Docker prefix and cleanup path if relevant
+        if is_docker:
+            if "docker/overlay2" in program:
+                parts_path = program.split("/merged/")
+                if len(parts_path) == 2:
+                    program = f"[Docker] {parts_path[1]}"
+                else:
+                    program = f"[Docker] {os.path.basename(program)}"
+            else:
+                program = f"[Docker] {program}"
+        
+        # Simplify common programs for premium display
+        if "chrome" in program.lower():
+            if is_docker:
+                program = "[Docker] Google Chrome"
+            else:
+                program = "Google Chrome"
+        elif "firefox" in program.lower():
+            if is_docker:
+                program = "[Docker] Mozilla Firefox"
+            else:
+                program = "Mozilla Firefox"
+        elif "tailscaled" in program.lower():
+            program = "Tailscale VPN"
 
         if sent_kb == 0.0 and recv_kb == 0.0:
             continue

@@ -232,7 +232,10 @@ def print_dashboard(total_sent, total_recv, programs, trend, period_label, is_li
             for idx, (program, sent, recv, total) in enumerate(programs[:app_rows], 1):
                 display_name = program
                 if len(display_name) > app_width:
-                    display_name = "..." + display_name[-(app_width - 3):]
+                    if display_name.startswith("/"):
+                        display_name = "..." + display_name[-(app_width - 3):]
+                    else:
+                        display_name = display_name[:(app_width - 3)] + "..."
                 print(f"  {idx:<4} {display_name:<{app_width}} {format_bytes(sent):>10} {format_bytes(recv):>10} {format_bytes(total):>10}")
         else:
             app_width = width - 19
@@ -241,7 +244,10 @@ def print_dashboard(total_sent, total_recv, programs, trend, period_label, is_li
             for idx, (program, sent, recv, total) in enumerate(programs[:app_rows], 1):
                 display_name = program
                 if len(display_name) > app_width:
-                    display_name = "..." + display_name[-(app_width - 3):]
+                    if display_name.startswith("/"):
+                        display_name = "..." + display_name[-(app_width - 3):]
+                    else:
+                        display_name = display_name[:(app_width - 3)] + "..."
                 print(f"  {idx:<4} {display_name:<{app_width}} {format_bytes(total):>10}")
     print("=" * width)
 
