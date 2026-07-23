@@ -1,0 +1,97 @@
+=== FILTER TABLE ===
+-P INPUT ACCEPT
+-P FORWARD ACCEPT
+-P OUTPUT ACCEPT
+-N DOCKER
+-N DOCKER-BRIDGE
+-N DOCKER-CT
+-N DOCKER-FORWARD
+-N DOCKER-INTERNAL
+-N DOCKER-USER
+-N NETTRACK-PORTAL
+-N NETTRACK-PORTAL-ALLOW
+-N ufw-after-forward
+-N ufw-after-input
+-N ufw-after-logging-forward
+-N ufw-after-logging-input
+-N ufw-after-logging-output
+-N ufw-after-output
+-N ufw-before-forward
+-N ufw-before-input
+-N ufw-before-logging-forward
+-N ufw-before-logging-input
+-N ufw-before-logging-output
+-N ufw-before-output
+-N ufw-reject-forward
+-N ufw-reject-input
+-N ufw-reject-output
+-N ufw-track-forward
+-N ufw-track-input
+-N ufw-track-output
+-A INPUT -p tcp -m tcp --dport 6053 -j ACCEPT
+-A INPUT -p udp -m udp --dport 6053 -j ACCEPT
+-A INPUT -p tcp -m tcp --dport 6054 -j ACCEPT
+-A INPUT -j ufw-before-logging-input
+-A INPUT -j ufw-before-input
+-A INPUT -j ufw-after-input
+-A INPUT -j ufw-after-logging-input
+-A INPUT -j ufw-reject-input
+-A INPUT -j ufw-track-input
+-A FORWARD -j DOCKER-USER
+-A FORWARD -j DOCKER-FORWARD
+-A FORWARD -i eno1 -j NETTRACK-PORTAL
+-A FORWARD -j ufw-before-logging-forward
+-A FORWARD -j ufw-before-forward
+-A FORWARD -j ufw-after-forward
+-A FORWARD -j ufw-after-logging-forward
+-A FORWARD -j ufw-reject-forward
+-A FORWARD -j ufw-track-forward
+-A OUTPUT -j ufw-before-logging-output
+-A OUTPUT -j ufw-before-output
+-A OUTPUT -j ufw-after-output
+-A OUTPUT -j ufw-after-logging-output
+-A OUTPUT -j ufw-reject-output
+-A OUTPUT -j ufw-track-output
+-A DOCKER -d 172.18.0.12/32 ! -i br-e7ddf5a6b866 -o br-e7ddf5a6b866 -p tcp -m tcp --dport 8080 -j ACCEPT
+-A DOCKER ! -i br-e7ddf5a6b866 -o br-e7ddf5a6b866 -j DROP
+-A DOCKER ! -i docker0 -o docker0 -j DROP
+-A DOCKER-BRIDGE -o br-e7ddf5a6b866 -j DOCKER
+-A DOCKER-BRIDGE -o docker0 -j DOCKER
+-A DOCKER-CT -o br-e7ddf5a6b866 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+-A DOCKER-CT -o docker0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+-A DOCKER-FORWARD -j DOCKER-CT
+-A DOCKER-FORWARD -j DOCKER-INTERNAL
+-A DOCKER-FORWARD -j DOCKER-BRIDGE
+-A DOCKER-FORWARD -i br-e7ddf5a6b866 -j ACCEPT
+-A DOCKER-FORWARD -i docker0 -j ACCEPT
+-A NETTRACK-PORTAL -j NETTRACK-PORTAL-ALLOW
+-A NETTRACK-PORTAL -p udp -m udp --dport 53 -j ACCEPT
+-A NETTRACK-PORTAL -p tcp -m tcp --dport 53 -j ACCEPT
+-A NETTRACK-PORTAL -d 192.168.1.100/32 -p tcp -m tcp --dport 6054 -j ACCEPT
+-A NETTRACK-PORTAL -o eno1 -j DROP
+-A NETTRACK-PORTAL-ALLOW -s 192.168.1.100/32 -j ACCEPT
+-A NETTRACK-PORTAL-ALLOW -d 192.168.1.100/32 -j ACCEPT
+-A NETTRACK-PORTAL-ALLOW -s 192.168.1.102/32 -j ACCEPT
+-A NETTRACK-PORTAL-ALLOW -d 192.168.1.102/32 -j ACCEPT
+=== NAT TABLE ===
+-P PREROUTING ACCEPT
+-P INPUT ACCEPT
+-P OUTPUT ACCEPT
+-P POSTROUTING ACCEPT
+-N DOCKER
+-N NETTRACK-PORTAL-NAT
+-A PREROUTING -j NETTRACK-PORTAL-NAT
+-A PREROUTING -m addrtype --dst-type LOCAL -j DOCKER
+-A OUTPUT ! -d 127.0.0.0/8 -m addrtype --dst-type LOCAL -j DOCKER
+-A POSTROUTING -s 172.17.0.0/16 ! -o docker0 -j MASQUERADE
+-A POSTROUTING -s 172.18.0.0/16 ! -o br-e7ddf5a6b866 -j MASQUERADE
+-A POSTROUTING -o eno1 -j MASQUERADE
+-A POSTROUTING -o eno1 -j MASQUERADE
+-A DOCKER ! -i br-e7ddf5a6b866 -p tcp -m tcp --dport 8080 -j DNAT --to-destination 172.18.0.12:8080
+-A NETTRACK-PORTAL-NAT -p udp -m udp --dport 53 -j DNAT --to-destination 192.168.1.100:6053
+-A NETTRACK-PORTAL-NAT -p tcp -m tcp --dport 53 -j DNAT --to-destination 192.168.1.100:6053
+-A NETTRACK-PORTAL-NAT -s 192.168.1.100/32 -j RETURN
+-A NETTRACK-PORTAL-NAT -s 192.168.1.102/32 -j RETURN
+-A NETTRACK-PORTAL-NAT -p tcp -m tcp --dport 80 -j DNAT --to-destination 192.168.1.100:6054
+=== IP FORWARD STATUS ===
+net.ipv4.ip_forward = 1
