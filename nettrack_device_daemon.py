@@ -1,714 +1,323 @@
 #!/usr/bin/env python3
-"""
-NetTrack Device Daemon
-======================
-Passively monitors per-device (IP/MAC) network usage across all connected
-devices by sniffing traffic on the specified interface in promiscuous mode.
-
-Data is stored hourly in /var/lib/nettrack/nettrack.db under the
-`device_usage` table, separate from per-process tracking.
-
-Usage:
-    sudo python3 nettrack_device_daemon.py [-i INTERFACE] [--db DB_PATH]
-
-Requires: tcpdump (apt install tcpdump) OR python3-scapy (apt install python3-scapy)
-"""
-
-import subprocess
 import os
 import sys
 import time
 import sqlite3
+import subprocess
 import threading
-import signal
-import re
-import struct
-import socket
 import argparse
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Configuration
-# ──────────────────────────────────────────────────────────────────────────────
-DB_DIR  = "/var/lib/nettrack"
-DB_PATH = os.path.join(DB_DIR, "nettrack.db")
+DB_PATH = "/var/lib/nettrack/nettrack.db"
+VAULT_DB_PATH = "/var/lib/nettrack/vault.db"
 
-# IP Addresses to exclude from traffic accounting (e.g. localhost)
-EXCLUDED_IPS = {"127.0.0.1"}
-try:
-    import subprocess
-    out = subprocess.check_output(["hostname", "-I"], text=True)
-    for ip in out.split():
-        # Keep 192.168.1.100 out of EXCLUDED_IPS so its local app traffic can be monitored
-        if ip != "192.168.1.100":
-            EXCLUDED_IPS.add(ip)
-except Exception:
-    pass
+# Accumulator lock
+lock = threading.Lock()
+# { (mac, ip): { 'sent': 0, 'received': 0 } }
+stats_accumulator = {}
 
-# Active NAT ports tracking to prevent double-counting forwarded client traffic
-active_nat_ports = set()
-nat_ports_lock = threading.Lock()
+# Vault accumulator
+vault_lock = threading.Lock()
+vault_accumulator = []
 
-def update_nat_ports_loop():
-    global active_nat_ports
-    print("[device] NAT port tracking thread started.", flush=True)
-    while not stop_event.is_set():
-        ports = set()
-        try:
-            if os.path.exists("/proc/net/nf_conntrack"):
-                with open("/proc/net/nf_conntrack", "r") as f:
-                    for line in f:
-                        parts = line.strip().split()
-                        
-                        # Find original source IP (first src= parameter)
-                        original_src = None
-                        for p in parts:
-                            if p.startswith("src="):
-                                original_src = p.split("=")[1]
-                                break
-                                
-                        # Only track NAT ports for local physical LAN clients (192.168.1.X)
-                        # This avoids excluding Docker/Tailscale/VPN container traffic, leaving them to be counted as Server traffic.
-                        if original_src and original_src.startswith("192.168.1.") and original_src != "192.168.1.100":
-                            if "dst=192.168.1.100" in parts:
-                                idx = parts.index("dst=192.168.1.100")
-                                for p in parts[idx:]:
-                                    if p.startswith("dport="):
-                                        ports.add(int(p.split("=")[1]))
-                                        break
-        except Exception:
-            pass
-        with nat_ports_lock:
-            active_nat_ports = ports
-        time.sleep(2)
+# Tracker for last seen iptables bytes: { ip: { 'sent': last_sent, 'recv': last_recv } }
+iptables_last_seen = {}
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Thread-safe state
-# ──────────────────────────────────────────────────────────────────────────────
-# accumulator: { hour_ts: { ip: { mac, sent, recv } } }
-accumulator = {}
-lock        = threading.Lock()
-stop_event  = threading.Event()
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Database helpers
-# ──────────────────────────────────────────────────────────────────────────────
-def init_db():
+def normalize_mac(mac):
     try:
-        os.makedirs(DB_DIR, exist_ok=True)
-        conn   = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
+        parts = mac.split(':')
+        if len(parts) == 6:
+            return ":".join(f"{int(p, 16):02x}" for p in parts)
+    except Exception:
+        pass
+    return mac.lower().strip()
 
-        # Create normalized tables
-        cursor.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            daily_limit_mb INTEGER DEFAULT 2048
-        );
-        """)
-
-        cursor.execute("""
-        CREATE TABLE IF NOT EXISTS devices (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-            device_name TEXT NOT NULL,
-            floor TEXT NOT NULL DEFAULT '',
-            device_type TEXT NOT NULL DEFAULT '',
-            cookie_uuid TEXT,
-            is_low_end INTEGER DEFAULT 0,
-            approved INTEGER DEFAULT 1,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        """)
-
-        cursor.execute("""
-        CREATE TABLE IF NOT EXISTS device_macs (
-            mac_address TEXT PRIMARY KEY,
-            device_id INTEGER REFERENCES devices(id) ON DELETE CASCADE
-        );
-        """)
-
-        cursor.execute("""
-        CREATE TABLE IF NOT EXISTS device_ips (
-            ip_address TEXT PRIMARY KEY,
-            device_id INTEGER REFERENCES devices(id) ON DELETE CASCADE,
-            mac_address TEXT REFERENCES device_macs(mac_address) ON DELETE SET NULL,
-            last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        """)
-
-        # Per-device hourly usage
-        cursor.execute("""
-        CREATE TABLE IF NOT EXISTS device_usage (
-            hour_timestamp INTEGER,
-            ip_address     TEXT    NOT NULL,
-            mac_address    TEXT    NOT NULL DEFAULT '',
-            sent_bytes     INTEGER NOT NULL DEFAULT 0,
-            received_bytes INTEGER NOT NULL DEFAULT 0,
-            PRIMARY KEY (hour_timestamp, ip_address)
-        );
-        """)
-
-        # Friendly labels for devices
-        cursor.execute("""
-        CREATE TABLE IF NOT EXISTS device_labels (
-            ip_address  TEXT PRIMARY KEY,
-            mac_address TEXT    NOT NULL DEFAULT '',
-            label       TEXT    NOT NULL DEFAULT '',
-            floor       TEXT    NOT NULL DEFAULT '',
-            device_type TEXT    NOT NULL DEFAULT ''
-        );
-        """)
-
-        conn.commit()
-        conn.close()
-
-        os.chmod(DB_DIR,  0o777)
-        os.chmod(DB_PATH, 0o666)
-        print(f"[device] Database ready at {DB_PATH}", flush=True)
-    except Exception as exc:
-        print(f"[device] DB init error: {exc}", file=sys.stderr, flush=True)
-        sys.exit(1)
-
-
-def get_hour_ts():
-    now = time.time()
-    return int(now - (now % 3600))
-
-
-def flush_accumulator():
-    global accumulator
-    with lock:
-        if not accumulator:
-            return
-        snapshot    = accumulator
-        accumulator = {}
-
+def get_mac_from_arp(ip):
+    # Try resolving MAC from DHCP leases first to get the client's real MAC
     try:
-        conn   = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        for hour_ts, devices in snapshot.items():
-            for ip, data in devices.items():
-                # Query the correct MAC address from the database (populated by the ARP loop)
-                mac = ""
-                cursor.execute("SELECT mac_address FROM device_ips WHERE ip_address = ?", (ip,))
-                db_row = cursor.fetchone()
-                if db_row and db_row[0]:
-                    mac = db_row[0]
-
-                cursor.execute("""
-                INSERT INTO device_usage
-                    (hour_timestamp, ip_address, mac_address, sent_bytes, received_bytes)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(hour_timestamp, ip_address) DO UPDATE SET
-                    mac_address    = CASE WHEN excluded.mac_address != '' THEN excluded.mac_address
-                                         ELSE mac_address END,
-                    sent_bytes     = sent_bytes     + excluded.sent_bytes,
-                    received_bytes = received_bytes + excluded.received_bytes;
-                """, (
-                    hour_ts,
-                    ip,
-                    mac,
-                    int(data.get("sent", 0)),
-                    int(data.get("recv", 0)),
-                ))
-        conn.commit()
-        conn.close()
-
-        try:
-            os.chmod(DB_PATH, 0o666)
-        except Exception:
-            pass
-
-    except Exception as exc:
-        print(f"[device] Flush error: {exc}", file=sys.stderr, flush=True)
-        # Restore lost data back into accumulator
-        with lock:
-            for hour_ts, devices in snapshot.items():
-                accumulator.setdefault(hour_ts, {})
-                for ip, data in devices.items():
-                    entry = accumulator[hour_ts].setdefault(
-                        ip, {"mac": data.get("mac", ""), "sent": 0, "recv": 0}
-                    )
-                    entry["sent"] += data.get("sent", 0)
-                    entry["recv"] += data.get("recv", 0)
-
-
-def flush_loop():
-    while not stop_event.is_set():
-        for _ in range(20):
-            if stop_event.is_set():
-                break
-            time.sleep(0.5)
-        flush_accumulator()
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Promiscuous mode helpers
-# ──────────────────────────────────────────────────────────────────────────────
-def enable_promisc(iface):
-    """Enable promiscuous mode using `ip link set <iface> promisc on`."""
-    try:
-        result = subprocess.run(
-            ["ip", "link", "set", iface, "promisc", "on"],
-            capture_output=True, text=True
-        )
-        if result.returncode == 0:
-            print(f"[device] Promiscuous mode enabled on {iface}", flush=True)
-        else:
-            print(
-                f"[device] Warning: could not enable promisc on {iface}: "
-                f"{result.stderr.strip()}",
-                flush=True
-            )
-    except Exception as exc:
-        print(f"[device] Warning: promisc enable failed: {exc}", flush=True)
-
-
-def disable_promisc(iface):
-    try:
-        subprocess.run(
-            ["ip", "link", "set", iface, "promisc", "off"],
-            capture_output=True, text=True
-        )
-        print(f"[device] Promiscuous mode disabled on {iface}", flush=True)
+        if os.path.exists("/var/lib/misc/dnsmasq.leases"):
+            with open("/var/lib/misc/dnsmasq.leases", "r") as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) >= 3 and parts[2] == ip:
+                        return normalize_mac(parts[1])
     except Exception:
         pass
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# IP helpers
-# ──────────────────────────────────────────────────────────────────────────────
-_PRIVATE_NETS = [
-    (0xC0A80000, 0xFFFF0000),   # 192.168.0.0/16
-    (0xAC100000, 0xFFF00000),   # 172.16.0.0/12
-    (0x0A000000, 0xFF000000),   # 10.0.0.0/8
-]
-
-def _ip_to_int(ip_str):
-    try:
-        packed = socket.inet_aton(ip_str)
-        return struct.unpack("!I", packed)[0]
-    except Exception:
-        return None
-
-def is_private_ip(ip_str):
-    val = _ip_to_int(ip_str)
-    if val is None:
-        return False
-    for net, mask in _PRIVATE_NETS:
-        if (val & mask) == net:
-            return True
-    return False
-
-def is_multicast_or_broadcast(ip_str):
-    val = _ip_to_int(ip_str)
-    if val is None:
-        return True
-    if (val & 0xF0000000) == 0xE0000000:  # 224.0.0.0/4  multicast
-        return True
-    if val == 0xFFFFFFFF:                  # 255.255.255.255
-        return True
-    return False
-
-def normalize_mac(mac_str):
-    return mac_str.lower().strip()
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Packet accounting
-# ──────────────────────────────────────────────────────────────────────────────
-def account_packet(src_ip, dst_ip, pkt_len, src_mac="", dst_mac="", src_port=None, dst_port=None):
-    """
-    Record a packet in the in-memory accumulator.
-    sent_bytes for the src_ip, received_bytes for dst_ip.
-    Only private LAN IPs are tracked.
-    """
-    # Exclude explicitly configured local loopback or other interfaces
-    if src_ip in EXCLUDED_IPS or dst_ip in EXCLUDED_IPS:
-        return
-
-    # For the server's primary IP, ignore packets if they correspond to active client NAT ports (double-counting prevention)
-    if src_ip == "192.168.1.100" and src_port is not None:
-        with nat_ports_lock:
-            if src_port in active_nat_ports or dst_port in active_nat_ports:
-                return
-    if dst_ip == "192.168.1.100" and dst_port is not None:
-        with nat_ports_lock:
-            if src_port in active_nat_ports or dst_port in active_nat_ports:
-                return
-
-    hour_ts = get_hour_ts()
-
-    with lock:
-        accumulator.setdefault(hour_ts, {})
-
-        if src_ip and is_private_ip(src_ip) and not is_multicast_or_broadcast(src_ip):
-            entry = accumulator[hour_ts].setdefault(
-                src_ip, {"mac": "", "sent": 0, "recv": 0}
-            )
-            entry["sent"] += pkt_len
-
-        if dst_ip and is_private_ip(dst_ip) and not is_multicast_or_broadcast(dst_ip):
-            entry = accumulator[hour_ts].setdefault(
-                dst_ip, {"mac": "", "sent": 0, "recv": 0}
-            )
-            entry["recv"] += pkt_len
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Backend 1: tcpdump (preferred – no extra Python lib required)
-# ──────────────────────────────────────────────────────────────────────────────
-# Example tcpdump line (-n -e -q ip):
-# 12:00:00.000000 aa:bb:cc:dd:ee:ff > 11:22:33:44:55:66, ethertype IPv4 (0x0800), length 1514: 192.168.1.5.443 > 192.168.1.10.51234: ...
-_TCPDUMP_LINE = re.compile(
-    r"(?P<src_mac>[0-9a-f]{2}(?::[0-9a-f]{2}){5})\s*>\s*"
-    r"(?P<dst_mac>[0-9a-f]{2}(?::[0-9a-f]{2}){5}).*?length\s+(?P<length>\d+):\s*"
-    r"(?P<src_ip>\d{1,3}(?:\.\d{1,3}){3})(?:\.(?P<src_port>\d+))?\s*>\s*"
-    r"(?P<dst_ip>\d{1,3}(?:\.\d{1,3}){3})(?:\.(?P<dst_port>\d+))?",
-    re.IGNORECASE
-)
-
-def sniff_with_tcpdump(iface):
-    """Run tcpdump and parse its line-based output. Returns True if started OK."""
-    cmd = [
-        "tcpdump",
-        "-i", iface,
-        "-n",               # No DNS resolution
-        "-e",               # Print MAC addresses
-        "-q",               # Quiet output
-        "-l",               # Line-buffered
-        "--immediate-mode",
-        "ip",               # IPv4 only
-    ]
-
-    print(f"[device] Starting tcpdump backend on {iface} ...", flush=True)
-
-    while not stop_event.is_set():
-        try:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1,
-            )
-        except FileNotFoundError:
-            print(
-                "[device] tcpdump not found. Install: sudo apt install tcpdump",
-                file=sys.stderr, flush=True
-            )
-            return False
-        except Exception as exc:
-            print(f"[device] tcpdump launch error: {exc}", file=sys.stderr, flush=True)
-            return False
-
-        print(f"[device] tcpdump running (PID {proc.pid})", flush=True)
-
-        while not stop_event.is_set():
-            line = proc.stdout.readline()
-            if not line:
-                if proc.poll() is not None:
-                    print("[device] tcpdump exited unexpectedly, restarting in 5s...", flush=True)
-                    break
-                continue
-
-            m = _TCPDUMP_LINE.search(line)
-            if m:
-                try:
-                    src_port = int(m.group("src_port")) if m.group("src_port") else None
-                    dst_port = int(m.group("dst_port")) if m.group("dst_port") else None
-                    account_packet(
-                        src_ip  = m.group("src_ip"),
-                        dst_ip  = m.group("dst_ip"),
-                        pkt_len = int(m.group("length")),
-                        src_mac = m.group("src_mac"),
-                        dst_mac = m.group("dst_mac"),
-                        src_port = src_port,
-                        dst_port = dst_port,
-                    )
-                except Exception:
-                    pass
-
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-
-        if not stop_event.is_set():
-            for _ in range(10):
-                if stop_event.is_set():
-                    break
-                time.sleep(0.5)
-
-    return True
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Backend 2: Scapy (fallback)
-# ──────────────────────────────────────────────────────────────────────────────
-def sniff_with_scapy(iface):
-    """Use Scapy for packet capture. Returns True if started OK."""
-    try:
-        from scapy.all import sniff as scapy_sniff, Ether, IP, TCP, UDP  # type: ignore
-    except ImportError:
-        print(
-            "[device] Scapy not installed. Install: sudo apt install python3-scapy",
-            file=sys.stderr, flush=True
-        )
-        return False
-
-    print(f"[device] Starting Scapy backend on {iface} ...", flush=True)
-
-    def handle_packet(pkt):
-        if stop_event.is_set():
-            return
-        try:
-            if IP in pkt:
-                src_port = None
-                dst_port = None
-                if TCP in pkt:
-                    src_port = pkt[TCP].sport
-                    dst_port = pkt[TCP].dport
-                elif UDP in pkt:
-                    src_port = pkt[UDP].sport
-                    dst_port = pkt[UDP].dport
-                account_packet(
-                    src_ip  = pkt[IP].src,
-                    dst_ip  = pkt[IP].dst,
-                    pkt_len = len(pkt),
-                    src_mac = pkt[Ether].src if Ether in pkt else "",
-                    dst_mac = pkt[Ether].dst if Ether in pkt else "",
-                    src_port = src_port,
-                    dst_port = dst_port,
-                )
-        except Exception:
-            pass
-
-    while not stop_event.is_set():
-        try:
-            scapy_sniff(
-                iface=iface,
-                prn=handle_packet,
-                store=False,
-                stop_filter=lambda _: stop_event.is_set(),
-                timeout=10,
-                filter="ip",
-            )
-        except Exception as exc:
-            if not stop_event.is_set():
-                print(f"[device] Scapy error: {exc} – retrying in 5s...", flush=True)
-                for _ in range(10):
-                    if stop_event.is_set():
-                        break
-                    time.sleep(0.5)
-
-    return True
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# ARP cache refresher
-# ──────────────────────────────────────────────────────────────────────────────
-def is_mac_shared(mac_address):
-    if not mac_address or mac_address == "00:00:00:00:00:00":
-        return False
-    mac_lower = mac_address.lower().strip()
-    count = 0
+    # Fallback to local ARP table
     try:
         with open("/proc/net/arp", "r") as f:
-            for line in f.readlines()[1:]:
-                parts = line.split()
-                if len(parts) >= 4:
-                    if parts[3].lower().strip() == mac_lower:
-                        count += 1
-                        if count > 1:
-                            return True
-    except Exception:
-        pass
-    return False
-
-def refresh_arp_cache():
-    """Parse /proc/net/arp and update MAC addresses in device_labels."""
-    arp_table = {}
-    try:
-        with open("/proc/net/arp", "r") as f:
-            for line in f.readlines()[1:]:
-                parts = line.split()
-                if len(parts) >= 4:
-                    ip  = parts[0]
-                    mac = parts[3]
-                    if mac and mac != "00:00:00:00:00:00":
-                        arp_table[ip] = normalize_mac(mac)
-    except Exception:
-        pass
-
-    if not arp_table:
-        return
-
-    # Count occurrences to detect shared MACs
-    mac_counts = {}
-    for ip, mac in arp_table.items():
-        if mac and mac != "00:00:00:00:00:00":
-            mac_counts[mac] = mac_counts.get(mac, 0) + 1
-
-    try:
-        conn   = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        for ip, mac in arp_table.items():
-            if mac and mac != "00:00:00:00:00:00":
-                is_shared = mac_counts.get(mac, 0) > 1
-
-                # If this IP is already mapped to an approved device,
-                # and the current MAC is shared, do not overwrite the mapping
-                # to prevent signing out the registered device.
-                cursor.execute("""
-                    SELECT d.approved FROM device_ips di
-                    JOIN devices d ON di.device_id = d.id
-                    WHERE di.ip_address = ?
-                """, (ip,))
-                existing_row = cursor.fetchone()
-                if existing_row and existing_row[0] == 1 and is_shared:
-                    continue
-
-                cursor.execute("SELECT device_id FROM device_macs WHERE mac_address = ?", (mac,))
-                d_row = cursor.fetchone()
-                if d_row:
-                    device_id = d_row[0]
-                else:
-                    cursor.execute("INSERT INTO devices (user_id, device_name, floor, device_type, approved) VALUES (NULL, 'Discovered Device', '', '', 0)")
-                    device_id = cursor.lastrowid
-                    cursor.execute("INSERT OR IGNORE INTO device_macs (mac_address, device_id) VALUES (?, ?)", (mac, device_id))
-                
-                cursor.execute("""
-                INSERT INTO device_ips (ip_address, device_id, mac_address, last_seen)
-                VALUES (?, ?, ?, datetime('now', 'localtime'))
-                ON CONFLICT(ip_address) DO UPDATE SET
-                    device_id = excluded.device_id,
-                    mac_address = excluded.mac_address,
-                    last_seen = excluded.last_seen;
-                """, (ip, device_id, mac))
-                
-                if not is_shared:
-                    cursor.execute("DELETE FROM device_ips WHERE mac_address = ? AND ip_address != ?", (mac, ip))
-        conn.commit()
-        conn.close()
-    except Exception as exc:
-        print(f"[device] ARP refresh DB error: {exc}", flush=True)
-
-
-def arp_loop():
-    while not stop_event.is_set():
-        refresh_arp_cache()
-        for _ in range(60):   # every ~30 s
-            if stop_event.is_set():
-                break
-            time.sleep(0.5)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Interface auto-detection
-# ──────────────────────────────────────────────────────────────────────────────
-def detect_interface():
-    try:
-        result = subprocess.run(
-            ["ip", "-o", "-4", "route", "show", "default"],
-            capture_output=True, text=True
-        )
-        for line in result.stdout.strip().splitlines():
+            lines = f.readlines()
+        for line in lines[1:]:
             parts = line.split()
-            if "dev" in parts:
-                return parts[parts.index("dev") + 1]
+            if len(parts) >= 4 and parts[0] == ip:
+                return normalize_mac(parts[3])
     except Exception:
         pass
+    return "unknown"
 
+def get_primary_interface():
     try:
-        for iface in sorted(os.listdir("/sys/class/net")):
-            if iface != "lo" and not iface.startswith("docker") and not iface.startswith("veth"):
-                return iface
+        res = subprocess.run("ip -o -4 route show default", shell=True, capture_output=True, text=True)
+        parts = res.stdout.split()
+        if "dev" in parts:
+            return parts[parts.index("dev") + 1]
     except Exception:
         pass
+    return "eno1"
 
-    return "eth0"
+def init_vault_db():
+    try:
+        os.makedirs("/var/lib/nettrack", exist_ok=True)
+        conn = sqlite3.connect(VAULT_DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS raw_traffic (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            src_mac TEXT,
+            src_ip TEXT,
+            dst_mac TEXT,
+            dst_ip TEXT,
+            bytes INTEGER
+        );
+        """)
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[device] Error initializing vault db: {e}", file=sys.stderr, flush=True)
 
+def parse_iptables_counters():
+    global iptables_last_seen, stats_accumulator
+    try:
+        # Get raw byte counts from iptables ALLOW chain
+        res = subprocess.run("iptables -L NETTRACK-PORTAL-ALLOW -v -n -x", shell=True, capture_output=True, text=True)
+        lines = res.stdout.splitlines()
+        
+        # Temporary storage for current check
+        # { ip: { 'sent': bytes, 'recv': bytes } }
+        current_counters = {}
+        
+        for line in lines:
+            parts = line.strip().split()
+            # Expecting: pkts bytes target prot opt in out source destination
+            if len(parts) >= 9 and parts[2] == "ACCEPT":
+                try:
+                    bytes_val = int(parts[1])
+                    src = parts[7]
+                    dst = parts[8]
+                    
+                    if src.startswith("192.168.1.") and dst == "0.0.0.0/0":
+                        ip = src
+                        if ip not in current_counters:
+                            current_counters[ip] = {'sent': 0, 'recv': 0}
+                        current_counters[ip]['sent'] = bytes_val
+                        
+                    elif dst.startswith("192.168.1.") and src == "0.0.0.0/0":
+                        ip = dst
+                        if ip not in current_counters:
+                            current_counters[ip] = {'sent': 0, 'recv': 0}
+                        current_counters[ip]['recv'] = bytes_val
+                except ValueError:
+                    continue
+        
+        # Calculate deltas and update stats_accumulator
+        with lock:
+            for ip, counts in current_counters.items():
+                mac = get_mac_from_arp(ip)
+                if mac == "unknown":
+                    continue
+                    
+                last = iptables_last_seen.get(ip, {'sent': 0, 'recv': 0})
+                
+                # Sent delta
+                if counts['sent'] >= last['sent']:
+                    sent_delta = counts['sent'] - last['sent']
+                else:
+                    sent_delta = counts['sent'] # Chain was flushed
+                    
+                # Recv delta
+                if counts['recv'] >= last['recv']:
+                    recv_delta = counts['recv'] - last['recv']
+                else:
+                    recv_delta = counts['recv'] # Chain was flushed
+                
+                if sent_delta > 0 or recv_delta > 0:
+                    key = (mac, ip)
+                    if key not in stats_accumulator:
+                        stats_accumulator[key] = {'sent': 0, 'received': 0}
+                    stats_accumulator[key]['sent'] += sent_delta
+                    stats_accumulator[key]['received'] += recv_delta
+                    
+            # Save current state for next loop iteration
+            iptables_last_seen = current_counters
+            
+    except Exception as e:
+        print(f"[device] Error parsing iptables counters: {e}", file=sys.stderr, flush=True)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Signal handling
-# ──────────────────────────────────────────────────────────────────────────────
-_iface_global = None
+def iptables_accounting_loop():
+    print("[device] Starting 100% accurate iptables byte accounting loop...", flush=True)
+    while True:
+        parse_iptables_counters()
+        time.sleep(5) # Query every 5 seconds for high resolution limit enforcement
 
-def signal_handler(signum, frame):
-    print(f"\n[device] Signal {signum} received. Shutting down...", flush=True)
-    stop_event.set()
+def flush_stats():
+    global stats_accumulator
+    while True:
+        time.sleep(10)
+        with lock:
+            if not stats_accumulator:
+                continue
+            to_flush = stats_accumulator.copy()
+            stats_accumulator.clear()
 
+        # Write to SQLite
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+            
+            # Current hour timestamp for aggregate
+            hour_ts = time.strftime("%Y-%m-%d %H:00:00", time.gmtime())
+            
+            for (mac, ip), bytes_data in to_flush.items():
+                sent = bytes_data['sent']
+                recv = bytes_data['received']
+                
+                # Check if entry exists for this MAC and hour
+                cursor.execute("""
+                SELECT sent_bytes, received_bytes FROM device_usage
+                WHERE mac_address = ? AND timestamp = ?;
+                """, (mac, hour_ts))
+                row = cursor.fetchone()
+                
+                if row:
+                    new_sent = row[0] + sent
+                    new_recv = row[1] + recv
+                    cursor.execute("""
+                    UPDATE device_usage
+                    SET sent_bytes = ?, received_bytes = ?, ip_address = ?
+                    WHERE mac_address = ? AND timestamp = ?;
+                    """, (new_sent, new_recv, ip, mac, hour_ts))
+                else:
+                    cursor.execute("""
+                    INSERT INTO device_usage (mac_address, ip_address, timestamp, sent_bytes, received_bytes)
+                    VALUES (?, ?, ?, ?, ?);
+                    """, (mac, ip, hour_ts, sent, recv))
+            
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"[device] Error flushing stats: {e}", file=sys.stderr, flush=True)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Entry point
-# ──────────────────────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="NetTrack Device Daemon – passive per-device traffic monitor"
-    )
-    parser.add_argument(
-        "-i", "--interface", default=None,
-        help="Network interface to sniff (default: auto-detect)"
-    )
-    parser.add_argument(
-        "--db", default=DB_PATH,
-        help=f"Path to SQLite database (default: {DB_PATH})"
-    )
-    parser.add_argument(
-        "--no-promisc", action="store_true",
-        help="Skip enabling promiscuous mode (testing only)"
-    )
+def flush_vault():
+    global vault_accumulator
+    while True:
+        time.sleep(5)
+        with vault_lock:
+            if not vault_accumulator:
+                continue
+            to_flush = list(vault_accumulator)
+            vault_accumulator.clear()
+
+        try:
+            conn = sqlite3.connect(VAULT_DB_PATH)
+            cursor = conn.cursor()
+            cursor.executemany("""
+                INSERT INTO raw_traffic (src_mac, src_ip, dst_mac, dst_ip, bytes)
+                VALUES (?, ?, ?, ?, ?);
+            """, to_flush)
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"[device] Error flushing vault stats: {e}", file=sys.stderr, flush=True)
+
+def parse_tcpdump(iface):
+    print(f"[device] Starting tcpdump packet capture on interface: {iface}", flush=True)
+    
+    server_mac = "00:00:00:00:00:00"
+    try:
+        with open(f"/sys/class/net/{iface}/address", "r") as f:
+            server_mac = normalize_mac(f.read().strip())
+    except Exception:
+        pass
+        
+    # Enable promiscuous mode on interface
+    subprocess.run(f"ip link set {iface} promisc on", shell=True)
+    
+    # Run tcpdump to capture IP packets with link-level headers
+    # Using quiet mode (-q) to reduce stdout printing overhead
+    cmd = ["tcpdump", "-q", "-l", "-n", "-e", "-i", iface, "ip"]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    
+    try:
+        for line in proc.stdout:
+            parts = line.strip().split()
+            if len(parts) < 10:
+                continue
+            
+            try:
+                # Find length
+                length_idx = -1
+                for idx, part in enumerate(parts):
+                    if part == "length" and idx + 1 < len(parts):
+                        length_idx = idx + 1
+                        break
+                if length_idx == -1:
+                    continue
+                
+                length_str = parts[length_idx].rstrip(':')
+                pkt_len = int(length_str)
+                
+                # MAC addresses
+                src_mac = normalize_mac(parts[1])
+                dst_mac = normalize_mac(parts[3].rstrip(','))
+                
+                # IP addresses
+                ip_part = parts[length_idx + 1]
+                src_ip = ".".join(ip_part.split(".")[:4])
+                
+                dst_ip_part = parts[length_idx + 3].rstrip(':')
+                dst_ip = ".".join(dst_ip_part.split(".")[:4])
+                
+                # Log server local traffic (which bypasses forward chain iptables counters)
+                if src_ip == "192.168.1.100" or dst_ip == "192.168.1.100":
+                    with lock:
+                        key = (server_mac, "192.168.1.100")
+                        if key not in stats_accumulator:
+                            stats_accumulator[key] = {'sent': 0, 'received': 0}
+                        if src_ip == "192.168.1.100":
+                            stats_accumulator[key]['sent'] += pkt_len
+                        if dst_ip == "192.168.1.100":
+                            stats_accumulator[key]['received'] += pkt_len
+
+                # Log to vault
+                with vault_lock:
+                    if len(vault_accumulator) < 5000:
+                        vault_accumulator.append((src_mac, src_ip, dst_mac, dst_ip, pkt_len))
+            except Exception:
+                continue
+    except KeyboardInterrupt:
+        pass
+    finally:
+        proc.terminate()
+        # Disable promiscuous mode on interface
+        subprocess.run(f"ip link set {iface} promisc off", shell=True)
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-i", "--interface", help="Interface to sniff on")
     args = parser.parse_args()
+    
+    iface = args.interface or get_primary_interface()
+    
+    init_vault_db()
+    
+    # Run stats flush threads
+    threading.Thread(target=flush_stats, daemon=True).start()
+    threading.Thread(target=flush_vault, daemon=True).start()
+    threading.Thread(target=iptables_accounting_loop, daemon=True).start()
+    
+    # Parse tcpdump for Vault connection flow
+    parse_tcpdump(iface)
 
-    if os.geteuid() != 0:
-        print("[device] Error: must run as root (sudo).", file=sys.stderr, flush=True)
-        sys.exit(1)
-
-    iface   = args.interface or detect_interface()
-    DB_PATH = args.db
-    _iface_global = iface
-
-    signal.signal(signal.SIGTERM, signal_handler)
-    signal.signal(signal.SIGINT,  signal_handler)
-
-    print(f"[device] NetTrack Device Daemon  |  interface: {iface}  |  db: {DB_PATH}", flush=True)
-
-    init_db()
-
-    if not args.no_promisc:
-        enable_promisc(iface)
-
-    # Background threads
-    flush_thread = threading.Thread(target=flush_loop, daemon=True)
-    flush_thread.start()
-
-    arp_thread = threading.Thread(target=arp_loop, daemon=True)
-    arp_thread.start()
-
-    nat_thread = threading.Thread(target=update_nat_ports_loop, daemon=True)
-    nat_thread.start()
-
-    # Try tcpdump first, fall back to Scapy
-    success = sniff_with_tcpdump(iface)
-    if not success:
-        success = sniff_with_scapy(iface)
-
-    if not success:
-        print("[device] No packet capture backend available. Exiting.", file=sys.stderr, flush=True)
-        stop_event.set()
-        sys.exit(1)
-
-    flush_thread.join(timeout=5)
-    arp_thread.join(timeout=5)
-    nat_thread.join(timeout=5)
-
-    flush_accumulator()
-
-    if not args.no_promisc:
-        disable_promisc(iface)
-
-    print("[device] Daemon stopped.", flush=True)
+if __name__ == "__main__":
+    main()
