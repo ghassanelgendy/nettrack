@@ -808,26 +808,62 @@ class WebServerHandler(BaseHTTPRequestHandler):
         active_leases = get_active_leases()
         static_reservations = get_static_reservations()
 
-        # Generate HTML components
-        device_rows_html = "".join([f"""
-        <tr>
-            <td>
-                <span style="font-weight:bold; color:#fff;">{dev['name']}</span><br>
-                <span style="font-size:12px; color:rgba(255,255,255,0.4)">{dev['ip']}</span>
-            </td>
-            <td><code style="background: rgba(255,255,255,0.1); padding: 2px 6px; border-radius: 4px; cursor: pointer; vertical-align: middle;" title="Double-click to de-authorize" ondblclick="if(confirm('Are you sure you want to de-authorize this device?')){{ window.location.href='/api/deassociate?mac={dev['mac']}'; }}">{dev['mac']}</code></td>
-            <td>{dev['user']}</td>
-            <td>{dev['sent']} / {dev['recv']}</td>
-            <td>
-                <!-- Rename Device -->
-                <form method="POST" action="/device/rename" style="display:inline-block; margin-right:5px; vertical-align:middle;">
-                    <input type="hidden" name="mac" value="{dev['mac']}">
-                    <input type="text" name="name" placeholder="Rename..." required style="padding:4px 8px; font-size:11px; width:80px; background:rgba(0,0,0,0.3); color:#fff; border:1px solid rgba(255,255,255,0.1); border-radius:4px; vertical-align:middle;">
-                    <input type="submit" value="Rename" style="padding:4px 8px; font-size:11px; background:#6366f1; color:#fff; border:none; border-radius:4px; cursor:pointer; vertical-align:middle;">
-                </form>
-                <a href="/api/dhcp/preserve_device?mac={dev['mac']}&ip={dev['ip']}&name={urllib.parse.quote(dev['name'])}" style="display:inline-block; font-size:11px; padding:5px 10px; background:#10b981; color:#fff; border:none; border-radius:4px; text-decoration:none; margin-right:5px; font-weight:bold; cursor:pointer; vertical-align:middle;">Preserve IP</a>
-            </td>
-        </tr>""" for dev in devices_list])
+        # Group and sort devices by user and overall usage
+        user_to_devices = {}
+        for dev in devices_list:
+            user = dev['user']
+            if user not in user_to_devices:
+                user_to_devices[user] = []
+            user_to_devices[user].append(dev)
+
+        # Sort devices within each user by overall usage (total_bytes) descending
+        for user in user_to_devices:
+            user_to_devices[user].sort(key=lambda x: x['total_bytes'], reverse=True)
+
+        # Calculate user total usages
+        user_totals = {}
+        for user, devs in user_to_devices.items():
+            user_totals[user] = sum(d['total_bytes'] for d in devs)
+
+        # Sort users by overall usage descending
+        sorted_users = sorted(user_to_devices.keys(), key=lambda u: user_totals[u], reverse=True)
+
+        device_rows = []
+        for user in sorted_users:
+            # Header row for the user group
+            device_rows.append(f"""
+            <tr style="background: rgba(99, 102, 241, 0.15); border-left: 4px solid #6366f1;">
+                <td colspan="5" style="padding: 10px 16px; font-weight: bold; color: #a5b4fc;">
+                    User: {user} &mdash; Total Usage: {format_bytes(user_totals[user])}
+                </td>
+            </tr>
+            """)
+            # Device rows under this user
+            for dev in user_to_devices[user]:
+                device_rows.append(f"""
+                <tr>
+                    <td style="padding-left: 30px;">
+                        <span style="font-weight:bold; color:#fff;">{dev['name']}</span><br>
+                        <span style="font-size:12px; color:rgba(255,255,255,0.4)">{dev['ip']}</span>
+                    </td>
+                    <td><code style="background: rgba(255,255,255,0.1); padding: 2px 6px; border-radius: 4px; cursor: pointer; vertical-align: middle;" title="Double-click to de-authorize" ondblclick="if(confirm('Are you sure you want to de-authorize this device?')){{ window.location.href='/api/deassociate?mac={dev['mac']}'; }}">{dev['mac']}</code></td>
+                    <td>{dev['user']}</td>
+                    <td>
+                        <div>{dev['sent']} / {dev['recv']}</div>
+                        <div style="font-size: 11px; color: #10b981; font-weight: bold; margin-top: 2px;">Total: {format_bytes(dev['total_bytes'])}</div>
+                    </td>
+                    <td>
+                        <!-- Rename Device -->
+                        <form method="POST" action="/device/rename" style="display:inline-block; margin-right:5px; vertical-align:middle;">
+                            <input type="hidden" name="mac" value="{dev['mac']}">
+                            <input type="text" name="name" placeholder="Rename..." required style="padding:4px 8px; font-size:11px; width:80px; background:rgba(0,0,0,0.3); color:#fff; border:1px solid rgba(255,255,255,0.1); border-radius:4px; vertical-align:middle;">
+                            <input type="submit" value="Rename" style="padding:4px 8px; font-size:11px; background:#6366f1; color:#fff; border:none; border-radius:4px; cursor:pointer; vertical-align:middle;">
+                        </form>
+                        <a href="/api/dhcp/preserve_device?mac={dev['mac']}&ip={dev['ip']}&name={urllib.parse.quote(dev['name'])}" style="display:inline-block; font-size:11px; padding:5px 10px; background:#10b981; color:#fff; border:none; border-radius:4px; text-decoration:none; margin-right:5px; font-weight:bold; cursor:pointer; vertical-align:middle;">Preserve IP</a>
+                    </td>
+                </tr>""")
+
+        device_rows_html = "".join(device_rows)
 
         process_rows_html = "".join([f"""
         <tr>
