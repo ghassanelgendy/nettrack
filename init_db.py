@@ -91,6 +91,15 @@ def init_database():
     # Populate Default Groups
     cursor.execute("INSERT OR IGNORE INTO user_groups (name, daily_limit_bytes, monthly_limit_bytes) VALUES ('Standard', 5368709120, 107374182400);") # 5GB / 100GB
     cursor.execute("INSERT OR IGNORE INTO user_groups (name, daily_limit_bytes, monthly_limit_bytes) VALUES ('Heavy', 21474836480, 536870912000);") # 20GB / 500GB
+
+    # 4. Settings Table
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT
+    );
+    """)
+    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('global_pool_bytes', '1073741824000');")
     
     # 4. Hourly Bandwidth Usage Table
     cursor.execute("""
