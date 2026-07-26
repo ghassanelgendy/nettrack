@@ -122,13 +122,25 @@ class WebServerHandler(BaseHTTPRequestHandler):
             pass
         return None
 
+def get_billing_start():
+    import datetime
+    today = datetime.date.today()
+    if today.day >= 28:
+        start_date = today.replace(day=28)
+    else:
+        if today.month == 1:
+            start_date = today.replace(year=today.year - 1, month=12, day=28)
+        else:
+            start_date = today.replace(month=today.month - 1, day=28)
+    return start_date.strftime('%Y-%m-%d 00:00:00')
+
     def check_device_limits(self, ip, mac):
         try:
             conn = sqlite3.connect(DB_PATH)
             cursor = conn.cursor()
             
             today_start = datetime.date.today().strftime('%Y-%m-%d 00:00:00')
-            month_start = datetime.date.today().replace(day=1).strftime('%Y-%m-%d 00:00:00')
+            month_start = get_billing_start()
             
             cursor.execute("""
                 SELECT 
@@ -526,6 +538,20 @@ class WebServerHandler(BaseHTTPRequestHandler):
             self.send_response(303)
             self.send_header("Location", "/")
             self.end_headers()
+        elif self.path == "/settings/update":
+            global_pool_gb = float(params.get('global_pool_gb', [1000])[0])
+            global_pool_bytes = int(global_pool_gb * 1024 * 1024 * 1024)
+            try:
+                conn = sqlite3.connect(DB_PATH)
+                cursor = conn.cursor()
+                cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('global_pool_bytes', ?);", (str(global_pool_bytes),))
+                conn.commit()
+                conn.close()
+            except Exception as e:
+                print(f"Error updating global pool setting: {e}")
+            self.send_response(303)
+            self.send_header("Location", "/")
+            self.end_headers()
         else:
             self.send_response(404)
             self.end_headers()
@@ -842,22 +868,40 @@ class WebServerHandler(BaseHTTPRequestHandler):
                     g.id,
                     u.daily_limit_bytes,
                     u.monthly_limit_bytes,
-                    u.suggested_daily_limit_bytes,
-                    u.suggested_monthly_limit_bytes,
                     COALESCE((SELECT SUM(addon_bytes) FROM user_addons WHERE username = u.username), 0) AS total_addons
                 FROM users u 
                 LEFT JOIN user_groups g ON u.group_id = g.id;
             """)
             for row in cursor.fetchall():
-                username, gname, gid, dl, ml, sdl, sml, addons = row
+                username, gname, gid, dl, ml, addons = row
+                
+                # Dynamic heuristic suggestion: average daily usage of user's devices over past 7 days * 1.5
+                cursor.execute("SELECT mac_address FROM registered_devices WHERE username = ?;", (username,))
+                macs = [r[0] for r in cursor.fetchall()]
+                if macs:
+                    placeholders = ",".join(["?"] * len(macs))
+                    cursor.execute(f"""
+                        SELECT SUM(sent_bytes + received_bytes)
+                        FROM device_usage
+                        WHERE mac_address IN ({placeholders})
+                          AND timestamp >= datetime('now', '-7 days');
+                    """, macs)
+                    total_7days = cursor.fetchone()[0] or 0
+                    avg_daily = total_7days / 7.0
+                    heuristic_daily = max(int(avg_daily * 1.5), 2 * 1024*1024*1024) # minimum 2 GB
+                    heuristic_monthly = max(int(avg_daily * 30 * 1.5), 60 * 1024*1024*1024) # minimum 60 GB
+                else:
+                    heuristic_daily = 2 * 1024*1024*1024
+                    heuristic_monthly = 60 * 1024*1024*1024
+
                 users_list.append({
                     'username': username,
                     'group_name': gname or "None",
                     'group_id': gid,
                     'daily_limit': format_bytes(dl) if dl else "Group Default",
                     'monthly_limit': format_bytes(ml) if ml else "Group Default",
-                    'suggested_daily': format_bytes(sdl) if sdl else "None",
-                    'suggested_monthly': format_bytes(sml) if sml else "None",
+                    'suggested_daily': format_bytes(heuristic_daily),
+                    'suggested_monthly': format_bytes(heuristic_monthly),
                     'addons': format_bytes(addons) if addons else "0 B"
                 })
             
@@ -894,7 +938,7 @@ class WebServerHandler(BaseHTTPRequestHandler):
                 
             # Calculate today and month start
             today_start = datetime.date.today().strftime('%Y-%m-%d 00:00:00')
-            month_start = datetime.date.today().replace(day=1).strftime('%Y-%m-%d 00:00:00')
+            month_start = get_billing_start()
             
             # Fetch overall usage (Today)
             cursor.execute("SELECT SUM(sent_bytes + received_bytes) FROM device_usage WHERE timestamp >= ?;", (today_start,))
@@ -907,6 +951,21 @@ class WebServerHandler(BaseHTTPRequestHandler):
             # Fetch Total usage (all time)
             cursor.execute("SELECT SUM(sent_bytes + received_bytes) FROM device_usage;")
             overall_total = cursor.fetchone()[0] or 0
+
+            # Fetch global pool setting
+            cursor.execute("SELECT value FROM settings WHERE key = 'global_pool_bytes';")
+            row = cursor.fetchone()
+            global_pool_bytes = int(row[0]) if row else 1073741824000 # Default 1000 GB
+            
+            # Fetch total allocated bytes
+            cursor.execute("""
+                SELECT SUM(
+                    COALESCE(u.monthly_limit_bytes, ug.monthly_limit_bytes) + 
+                    COALESCE((SELECT SUM(addon_bytes) FROM user_addons WHERE username = u.username), 0)
+                ) FROM users u 
+                LEFT JOIN user_groups ug ON u.group_id = ug.id;
+            """)
+            total_allocated_bytes = cursor.fetchone()[0] or 0
             
             conn.close()
         except Exception as e:
@@ -1115,6 +1174,8 @@ class WebServerHandler(BaseHTTPRequestHandler):
         .stat-card.today::after {{ background: linear-gradient(90deg, #6366f1, #a855f7); }}
         .stat-card.mtd::after {{ background: linear-gradient(90deg, #10b981, #3b82f6); }}
         .stat-card.total::after {{ background: linear-gradient(90deg, #f59e0b, #ef4444); }}
+        .stat-card.pool::after {{ background: linear-gradient(90deg, #3b82f6, #06b6d4); }}
+        .stat-card.allocated::after {{ background: linear-gradient(90deg, #ec4899, #f43f5e); }}
         
         .stat-card .label {{
             font-size: 11px;
@@ -1147,12 +1208,22 @@ class WebServerHandler(BaseHTTPRequestHandler):
                 <span class="value">{format_bytes(overall_today)}</span>
             </div>
             <div class="stat-card mtd">
-                <span class="label">Month-to-Date (MTD) Usage</span>
+                <span class="label">Cycle Usage (Since 28th)</span>
                 <span class="value">{format_bytes(overall_mtd)}</span>
             </div>
             <div class="stat-card total">
                 <span class="label">Total Lifetime Usage</span>
                 <span class="value">{format_bytes(overall_total)}</span>
+            </div>
+            <div class="stat-card pool">
+                <span class="label">Global ISP Pool Limit</span>
+                <span class="value">{format_bytes(global_pool_bytes)}</span>
+                <div style="font-size:11px; color:rgba(255,255,255,0.4); margin-top:5px;">Remaining: {format_bytes(max(global_pool_bytes - overall_mtd, 0))}</div>
+            </div>
+            <div class="stat-card allocated">
+                <span class="label">Total Allocated Bandwidth</span>
+                <span class="value">{format_bytes(total_allocated_bytes)}</span>
+                <div style="font-size:11px; color:rgba(255,255,255,0.4); margin-top:5px;">Over-allocated: {format_bytes(max(total_allocated_bytes - global_pool_bytes, 0)) if total_allocated_bytes > global_pool_bytes else "0 B"}</div>
             </div>
         </div>
 
@@ -1287,6 +1358,17 @@ class WebServerHandler(BaseHTTPRequestHandler):
                 </div>
 
                 <div class="card">
+                    <h2>Configure Global ISP Bucket Pool</h2>
+                    <form method="POST" action="/settings/update">
+                        <div class="form-group">
+                            <label>Global ISP Bucket Size (GB)</label>
+                            <input type="number" name="global_pool_gb" step="any" value="{global_pool_bytes / (1024*1024*1024)}" required>
+                        </div>
+                        <button type="submit" class="btn-submit">Update Global Pool</button>
+                    </form>
+                </div>
+
+                <div class="card">
                     <h2>Configure User Limits & Bucket</h2>
                     <form method="POST" action="/users/configure_limits">
                         <div class="form-group">
@@ -1303,14 +1385,9 @@ class WebServerHandler(BaseHTTPRequestHandler):
                             <label>Custom Monthly Limit / Bucket (GB) &mdash; Leave blank for group default</label>
                             <input type="number" name="monthly_gb" step="any" placeholder="e.g., 100.0">
                         </div>
-                        <div class="form-group">
-                            <label>Suggested Daily Quota (GB) &mdash; Display recommendation</label>
-                            <input type="number" name="suggested_daily_gb" step="any" placeholder="e.g., 3.0">
-                        </div>
-                        <div class="form-group">
-                            <label>Suggested Monthly Quota (GB) &mdash; Display recommendation</label>
-                            <input type="number" name="suggested_monthly_gb" step="any" placeholder="e.g., 50.0">
-                        </div>
+                        <p style="font-size: 11px; color:#10b981; margin-top:5px; margin-bottom:10px;">
+                            * Heuristic suggested quotas are dynamically calculated in the Registered Users table below based on past week usage!
+                        </p>
                         <button type="submit" class="btn-submit">Save User Limits</button>
                     </form>
                 </div>
