@@ -5,6 +5,9 @@ import sqlite3
 DB_DIR = "/var/lib/nettrack"
 DB_PATH = os.path.join(DB_DIR, "nettrack.db")
 
+def normalize_mac(mac):
+    return mac.strip().lower().replace('-', ':')
+
 def init_database():
     os.makedirs(DB_DIR, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
