@@ -117,6 +117,71 @@ def get_billing_start():
             start_date = today.replace(month=today.month - 1, day=28)
     return start_date.strftime('%Y-%m-%d 00:00:00')
 
+def get_effective_user_limits():
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        
+        # Fetch global pool
+        cursor.execute("SELECT value FROM settings WHERE key = 'global_pool_bytes';")
+        row = cursor.fetchone()
+        global_pool = int(row[0]) if row else 1073741824000
+        
+        # Fetch all users with their group default limits, custom limits, and addons
+        cursor.execute("""
+            SELECT 
+                u.username,
+                ug.monthly_limit_bytes AS group_monthly,
+                u.monthly_limit_bytes AS custom_monthly,
+                COALESCE((SELECT SUM(addon_bytes) FROM user_addons WHERE username = u.username), 0) AS addons
+            FROM users u
+            LEFT JOIN user_groups ug ON u.group_id = ug.id;
+        """)
+        users_data = cursor.fetchall()
+        conn.close()
+        
+        specific_users = {}
+        default_users = {}
+        total_specific = 0
+        total_default_original = 0
+        sum_group_defaults = 0
+        
+        for username, group_monthly, custom_monthly, addons in users_data:
+            group_monthly = group_monthly or 0
+            if custom_monthly is not None:
+                specific_users[username] = (custom_monthly, addons)
+                total_specific += custom_monthly + addons
+            else:
+                default_users[username] = (group_monthly, addons)
+                total_default_original += group_monthly + addons
+                sum_group_defaults += group_monthly
+                
+        total_allocated = total_specific + total_default_original
+        effective_limits = {}
+        
+        if total_allocated > global_pool:
+            # Redistribute remaining pool to default users relatively
+            remaining_pool = max(global_pool - total_specific, 0)
+            
+            for username, (custom_monthly, addons) in specific_users.items():
+                effective_limits[username] = custom_monthly + addons
+                
+            for username, (group_monthly, addons) in default_users.items():
+                if sum_group_defaults > 0:
+                    share = (group_monthly / sum_group_defaults) * remaining_pool
+                else:
+                    share = 0
+                effective_limits[username] = int(share) + addons
+        else:
+            for username, group_monthly, custom_monthly, addons in users_data:
+                base = custom_monthly if custom_monthly is not None else (group_monthly or 0)
+                effective_limits[username] = base + addons
+                
+        return effective_limits
+    except Exception as e:
+        print(f"[web] Error calculating effective limits: {e}")
+        return {}
+
 class WebServerHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         return
@@ -144,8 +209,8 @@ class WebServerHandler(BaseHTTPRequestHandler):
             
             cursor.execute("""
                 SELECT 
+                    rd.username,
                     COALESCE(u.daily_limit_bytes, ug.daily_limit_bytes) AS d_limit,
-                    (COALESCE(u.monthly_limit_bytes, ug.monthly_limit_bytes) + COALESCE((SELECT SUM(addon_bytes) FROM user_addons WHERE username = u.username), 0)) AS m_limit,
                     COALESCE((SELECT SUM(du.sent_bytes + du.received_bytes) FROM device_usage du WHERE du.mac_address = rd.mac_address AND du.timestamp >= ?), 0) AS daily_used,
                     COALESCE((SELECT SUM(du.sent_bytes + du.received_bytes) FROM device_usage du WHERE du.mac_address = rd.mac_address AND du.timestamp >= ?), 0) AS monthly_used,
                     EXISTS(SELECT 1 FROM quota_bypasses WHERE mac_address = rd.mac_address) AS warning_bypassed
@@ -158,7 +223,10 @@ class WebServerHandler(BaseHTTPRequestHandler):
             conn.close()
             
             if row:
-                d_limit, m_limit, d_used, m_used, warning_bypassed = row
+                username, d_limit, d_used, m_used, warning_bypassed = row
+                effective_limits = get_effective_user_limits()
+                m_limit = effective_limits.get(username)
+                
                 # Check 100% daily
                 if d_limit is not None and d_limit > 0 and d_used >= d_limit:
                     return True, f"Daily limit of {format_bytes(d_limit)} exceeded (Used: {format_bytes(d_used)})", False
@@ -892,6 +960,36 @@ class WebServerHandler(BaseHTTPRequestHandler):
                 FROM users u 
                 LEFT JOIN user_groups g ON u.group_id = g.id;
             """)
+            # Fetch global pool setting
+            cursor.execute("SELECT value FROM settings WHERE key = 'global_pool_bytes';")
+            gp_row = cursor.fetchone()
+            global_pool_bytes = int(gp_row[0]) if gp_row else 1073741824000
+            
+            # Fetch total allocated bytes (intended)
+            cursor.execute("""
+                SELECT SUM(
+                    COALESCE(u.monthly_limit_bytes, ug.monthly_limit_bytes) + 
+                    COALESCE((SELECT SUM(addon_bytes) FROM user_addons WHERE username = u.username), 0)
+                ) FROM users u 
+                LEFT JOIN user_groups ug ON u.group_id = ug.id;
+            """)
+            total_allocated_bytes = cursor.fetchone()[0] or 0
+
+            # Get effective redistributed limits
+            effective_limits = get_effective_user_limits()
+
+            # Fetch users with limits, suggested limits, and addons
+            cursor.execute("""
+                SELECT 
+                    u.username, 
+                    g.name, 
+                    g.id,
+                    u.daily_limit_bytes,
+                    u.monthly_limit_bytes,
+                    COALESCE((SELECT SUM(addon_bytes) FROM user_addons WHERE username = u.username), 0) AS total_addons
+                FROM users u 
+                LEFT JOIN user_groups g ON u.group_id = g.id;
+            """)
             for row in cursor.fetchall():
                 username, gname, gid, dl, ml, addons = row
                 
@@ -914,45 +1012,35 @@ class WebServerHandler(BaseHTTPRequestHandler):
                     heuristic_daily = 2 * 1024*1024*1024
                     heuristic_monthly = 60 * 1024*1024*1024
 
+                # Determine if user limit got redistributed
+                actual_monthly = effective_limits.get(username, 0)
+                is_redistributed = (ml is None) and (total_allocated_bytes > global_pool_bytes)
+                
+                monthly_limit_str = format_bytes(actual_monthly)
+                if is_redistributed:
+                    monthly_limit_str += " (Redistributed)"
+
                 users_list.append({
                     'username': username,
                     'group_name': gname or "None",
                     'group_id': gid,
                     'daily_limit': format_bytes(dl) if dl else "Group Default",
-                    'monthly_limit': format_bytes(ml) if ml else "Group Default",
+                    'monthly_limit': monthly_limit_str,
                     'suggested_daily': format_bytes(heuristic_daily),
                     'suggested_monthly': format_bytes(heuristic_monthly),
                     'addons': format_bytes(addons) if addons else "0 B"
                 })
                 
-            # Fetch global pool setting for distribution calculations
-            cursor.execute("SELECT value FROM settings WHERE key = 'global_pool_bytes';")
-            set_row = cursor.fetchone()
-            global_pool_bytes_calc = int(set_row[0]) if set_row else 1073741824000
-            
             distribution_list = []
             for u in users_list:
-                # Fetch their specific monthly limit (custom or group default)
-                cursor.execute("""
-                    SELECT COALESCE(u.monthly_limit_bytes, ug.monthly_limit_bytes)
-                    FROM users u
-                    LEFT JOIN user_groups ug ON u.group_id = ug.id
-                    WHERE u.username = ?;
-                """, (u['username'],))
-                base_monthly = cursor.fetchone()[0] or 0
-                
-                # Fetch addon sum
-                cursor.execute("SELECT SUM(addon_bytes) FROM user_addons WHERE username = ?;", (u['username'],))
-                addons_sum = cursor.fetchone()[0] or 0
-                
-                total_alloc = base_monthly + addons_sum
-                share_pct = (total_alloc / global_pool_bytes_calc) * 100 if global_pool_bytes_calc > 0 else 0
+                actual_alloc = effective_limits.get(u['username'], 0)
+                share_pct = (actual_alloc / global_pool_bytes) * 100 if global_pool_bytes > 0 else 0
                 
                 distribution_list.append({
                     'username': u['username'],
-                    'total_alloc': total_alloc,
-                    'allocation_str': format_bytes(total_alloc) if total_alloc > 0 else "Unlimited",
-                    'share_str': f"{share_pct:.1f}%" if total_alloc > 0 else "N/A"
+                    'total_alloc': actual_alloc,
+                    'allocation_str': format_bytes(actual_alloc) if actual_alloc > 0 else "Unlimited",
+                    'share_str': f"{share_pct:.1f}%" if actual_alloc > 0 else "N/A"
                 })
             distribution_list.sort(key=lambda x: x['total_alloc'], reverse=True)
             
@@ -1010,21 +1098,6 @@ class WebServerHandler(BaseHTTPRequestHandler):
             cursor.execute("SELECT SUM(sent_bytes + received_bytes) FROM device_usage;")
             overall_total = cursor.fetchone()[0] or 0
 
-            # Fetch global pool setting
-            cursor.execute("SELECT value FROM settings WHERE key = 'global_pool_bytes';")
-            row = cursor.fetchone()
-            global_pool_bytes = int(row[0]) if row else 1073741824000 # Default 1000 GB
-            
-            # Fetch total allocated bytes
-            cursor.execute("""
-                SELECT SUM(
-                    COALESCE(u.monthly_limit_bytes, ug.monthly_limit_bytes) + 
-                    COALESCE((SELECT SUM(addon_bytes) FROM user_addons WHERE username = u.username), 0)
-                ) FROM users u 
-                LEFT JOIN user_groups ug ON u.group_id = ug.id;
-            """)
-            total_allocated_bytes = cursor.fetchone()[0] or 0
-            
             conn.close()
         except Exception as e:
             print(f"[web] DB read error: {e}", file=sys.stderr)
