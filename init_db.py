@@ -48,6 +48,25 @@ def init_database():
         FOREIGN KEY (username) REFERENCES users(username) ON DELETE CASCADE
     );
     """)
+
+    # 3.1. Quota Warning Bypasses (Bypasses the 80% warning limit)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS quota_bypasses (
+        mac_address TEXT PRIMARY KEY,
+        bypassed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    """)
+
+    # 3.2. User Addons (Purchased bandwidth additions)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS user_addons (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT NOT NULL,
+        addon_bytes INTEGER NOT NULL,
+        purchased_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (username) REFERENCES users(username) ON DELETE CASCADE
+    );
+    """)
     
     # Check and migrate columns dynamically if tables already existed
     try:
@@ -58,6 +77,14 @@ def init_database():
                 cursor.execute("ALTER TABLE users ADD COLUMN password TEXT DEFAULT '';")
             if 'group_id' not in columns:
                 cursor.execute("ALTER TABLE users ADD COLUMN group_id INTEGER;")
+            if 'daily_limit_bytes' not in columns:
+                cursor.execute("ALTER TABLE users ADD COLUMN daily_limit_bytes INTEGER DEFAULT NULL;")
+            if 'monthly_limit_bytes' not in columns:
+                cursor.execute("ALTER TABLE users ADD COLUMN monthly_limit_bytes INTEGER DEFAULT NULL;")
+            if 'suggested_daily_limit_bytes' not in columns:
+                cursor.execute("ALTER TABLE users ADD COLUMN suggested_daily_limit_bytes INTEGER DEFAULT NULL;")
+            if 'suggested_monthly_limit_bytes' not in columns:
+                cursor.execute("ALTER TABLE users ADD COLUMN suggested_monthly_limit_bytes INTEGER DEFAULT NULL;")
     except Exception as e:
         print(f"[db] Migration check warning: {e}")
     
