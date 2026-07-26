@@ -86,28 +86,50 @@ def update_allowed_ips():
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         
+        # Clean up expired warning bypasses (older than 24 hours)
+        cursor.execute("DELETE FROM quota_bypasses WHERE bypassed_at < datetime('now', '-1 day');")
+        conn.commit()
+        
         today_start = datetime.date.today().strftime('%Y-%m-%d 00:00:00')
         month_start = datetime.date.today().replace(day=1).strftime('%Y-%m-%d 00:00:00')
         
-        # Get all registered devices along with their usage and limits
+        # Get all registered devices along with their usage and effective limits
+        # Effective daily limit: u.daily_limit_bytes if set, else ug.daily_limit_bytes
+        # Effective monthly limit: (u.monthly_limit_bytes if set, else ug.monthly_limit_bytes) + sum of user addons
         cursor.execute("""
             SELECT 
                 rd.ip_address,
-                ug.daily_limit_bytes,
-                ug.monthly_limit_bytes,
-                COALESCE((SELECT SUM(du.sent_bytes + du.received_bytes) FROM device_usage du WHERE du.mac_address = rd.mac_address AND du.timestamp >= ?), 0) AS daily_used,
-                COALESCE((SELECT SUM(du.sent_bytes + du.received_bytes) FROM device_usage du WHERE du.mac_address = rd.mac_address AND du.timestamp >= ?), 0) AS monthly_used
+                COALESCE(u.daily_limit_bytes, ug.daily_limit_bytes) AS d_limit,
+                (COALESCE(u.monthly_limit_bytes, ug.monthly_limit_bytes) + COALESCE((SELECT SUM(addon_bytes) FROM user_addons WHERE username = u.username), 0)) AS m_limit,
+                COALESCE((SELECT SUM(du.sent_bytes + du.received_bytes) FROM device_usage du WHERE du.mac_address = rd.mac_address AND du.timestamp >= ?), 0) AS d_used,
+                COALESCE((SELECT SUM(du.sent_bytes + du.received_bytes) FROM device_usage du WHERE du.mac_address = rd.mac_address AND du.timestamp >= ?), 0) AS m_used,
+                EXISTS(SELECT 1 FROM quota_bypasses WHERE mac_address = rd.mac_address) AS warning_bypassed
             FROM registered_devices rd
             JOIN users u ON rd.username = u.username
             LEFT JOIN user_groups ug ON u.group_id = ug.id;
         """, (today_start, month_start))
         
         current_ips = set()
-        for ip, d_limit, m_limit, d_used, m_used in cursor.fetchall():
-            # If no limit is set (NULL), they are unlimited.
-            # Otherwise, verify they haven't exceeded either limit.
-            daily_ok = (d_limit is None or d_used < d_limit)
-            monthly_ok = (m_limit is None or m_used < m_limit)
+        for ip, d_limit, m_limit, d_used, m_used, warning_bypassed in cursor.fetchall():
+            # If no limit is set (NULL or 0/None), they are unlimited.
+            # Otherwise:
+            # 1. 100% block if usage exceeds limit.
+            # 2. 80% warning block if usage exceeds 80% of limit and they haven't bypassed it.
+            
+            daily_ok = True
+            if d_limit is not None and d_limit > 0:
+                if d_used >= d_limit:
+                    daily_ok = False
+                elif d_used >= d_limit * 0.8:
+                    daily_ok = bool(warning_bypassed)
+            
+            monthly_ok = True
+            if m_limit is not None and m_limit > 0:
+                if m_used >= m_limit:
+                    monthly_ok = False
+                elif m_used >= m_limit * 0.8:
+                    monthly_ok = bool(warning_bypassed)
+            
             if daily_ok and monthly_ok:
                 current_ips.add(ip)
                 
