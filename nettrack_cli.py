@@ -853,11 +853,31 @@ class WebServerHandler(BaseHTTPRequestHandler):
             
             # Fetch groups
             cursor.execute("SELECT id, name, daily_limit_bytes, monthly_limit_bytes FROM user_groups;")
-            for gid, name, dl, ml in cursor.fetchall():
+            groups_data = cursor.fetchall()
+            for gid, name, dl, ml in groups_data:
+                # Sum the usage of all devices owned by users in this group since month_start
+                month_start_temp = get_billing_start()
+                cursor.execute("""
+                    SELECT SUM(du.sent_bytes + du.received_bytes)
+                    FROM device_usage du
+                    JOIN registered_devices rd ON du.mac_address = rd.mac_address
+                    JOIN users u ON rd.username = u.username
+                    WHERE u.group_id = ? AND du.timestamp >= ?;
+                """, (gid, month_start_temp))
+                group_usage = cursor.fetchone()[0] or 0
+                
+                # Count distinct users and devices in this group
+                cursor.execute("SELECT COUNT(DISTINCT username) FROM users WHERE group_id = ?;", (gid,))
+                user_count = cursor.fetchone()[0] or 0
+                cursor.execute("SELECT COUNT(*) FROM registered_devices rd JOIN users u ON rd.username = u.username WHERE u.group_id = ?;", (gid,))
+                device_count = cursor.fetchone()[0] or 0
+                
                 groups_list.append({
                     'id': gid, 'name': name,
                     'daily': format_bytes(dl) if dl else "Unlimited",
-                    'monthly': format_bytes(ml) if ml else "Unlimited"
+                    'monthly': format_bytes(ml) if ml else "Unlimited",
+                    'usage': format_bytes(group_usage),
+                    'users_devices': f"{user_count} Users / {device_count} Devices"
                 })
                 
             # Fetch users with limits, suggested limits, and addons
@@ -904,6 +924,44 @@ class WebServerHandler(BaseHTTPRequestHandler):
                     'suggested_monthly': format_bytes(heuristic_monthly),
                     'addons': format_bytes(addons) if addons else "0 B"
                 })
+                
+            # Fetch global pool setting for distribution calculations
+            cursor.execute("SELECT value FROM settings WHERE key = 'global_pool_bytes';")
+            set_row = cursor.fetchone()
+            global_pool_bytes_calc = int(set_row[0]) if set_row else 1073741824000
+            
+            distribution_list = []
+            for u in users_list:
+                # Fetch their specific monthly limit (custom or group default)
+                cursor.execute("""
+                    SELECT COALESCE(u.monthly_limit_bytes, ug.monthly_limit_bytes)
+                    FROM users u
+                    LEFT JOIN user_groups ug ON u.group_id = ug.id
+                    WHERE u.username = ?;
+                """, (u['username'],))
+                base_monthly = cursor.fetchone()[0] or 0
+                
+                # Fetch addon sum
+                cursor.execute("SELECT SUM(addon_bytes) FROM user_addons WHERE username = ?;", (u['username'],))
+                addons_sum = cursor.fetchone()[0] or 0
+                
+                total_alloc = base_monthly + addons_sum
+                share_pct = (total_alloc / global_pool_bytes_calc) * 100 if global_pool_bytes_calc > 0 else 0
+                
+                distribution_list.append({
+                    'username': u['username'],
+                    'total_alloc': total_alloc,
+                    'allocation_str': format_bytes(total_alloc) if total_alloc > 0 else "Unlimited",
+                    'share_str': f"{share_pct:.1f}%" if total_alloc > 0 else "N/A"
+                })
+            distribution_list.sort(key=lambda x: x['total_alloc'], reverse=True)
+            
+            distribution_rows_html = "".join([f"""
+            <tr>
+                <td><strong>{d['username']}</strong></td>
+                <td>{d['allocation_str']}</td>
+                <td>{d['share_str']}</td>
+            </tr>""" for d in distribution_list])
             
             # Fetch registered devices
             cursor.execute("SELECT mac_address, ip_address, username, registered_at, device_name FROM registered_devices;")
@@ -1042,9 +1100,11 @@ class WebServerHandler(BaseHTTPRequestHandler):
 
         group_rows_html = "".join([f"""
         <tr>
-            <td>{g['name']}</td>
+            <td><strong>{g['name']}</strong></td>
             <td>{g['daily']}</td>
             <td>{g['monthly']}</td>
+            <td><strong>{g['usage']}</strong></td>
+            <td>{g['users_devices']}</td>
         </tr>""" for g in groups_list])
 
         user_rows_html = "".join([f"""
@@ -1290,10 +1350,12 @@ class WebServerHandler(BaseHTTPRequestHandler):
                                 <th>Group Name</th>
                                 <th>Daily Limit</th>
                                 <th>Monthly Limit</th>
+                                <th>Consolidated Usage</th>
+                                <th>Users / Devices</th>
                             </tr>
                         </thead>
                         <tbody>
-                            {group_rows_html or '<tr><td colspan="3" style="text-align:center;">No groups defined.</td></tr>'}
+                            {group_rows_html or '<tr><td colspan="5" style="text-align:center;">No groups defined.</td></tr>'}
                         </tbody>
                     </table>
                 </div>
@@ -1366,6 +1428,22 @@ class WebServerHandler(BaseHTTPRequestHandler):
                         </div>
                         <button type="submit" class="btn-submit">Update Global Pool</button>
                     </form>
+                </div>
+
+                <div class="card">
+                    <h2>Global Pool Distribution Breakdown</h2>
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>User</th>
+                                <th>Monthly Allocation</th>
+                                <th>Share of Pool</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {distribution_rows_html or '<tr><td colspan="3" style="text-align:center;">No distributions computed.</td></tr>'}
+                        </tbody>
+                    </table>
                 </div>
 
                 <div class="card">
