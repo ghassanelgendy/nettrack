@@ -132,10 +132,11 @@ class WebServerHandler(BaseHTTPRequestHandler):
             
             cursor.execute("""
                 SELECT 
-                    ug.daily_limit_bytes,
-                    ug.monthly_limit_bytes,
+                    COALESCE(u.daily_limit_bytes, ug.daily_limit_bytes) AS d_limit,
+                    (COALESCE(u.monthly_limit_bytes, ug.monthly_limit_bytes) + COALESCE((SELECT SUM(addon_bytes) FROM user_addons WHERE username = u.username), 0)) AS m_limit,
                     COALESCE((SELECT SUM(du.sent_bytes + du.received_bytes) FROM device_usage du WHERE du.mac_address = rd.mac_address AND du.timestamp >= ?), 0) AS daily_used,
-                    COALESCE((SELECT SUM(du.sent_bytes + du.received_bytes) FROM device_usage du WHERE du.mac_address = rd.mac_address AND du.timestamp >= ?), 0) AS monthly_used
+                    COALESCE((SELECT SUM(du.sent_bytes + du.received_bytes) FROM device_usage du WHERE du.mac_address = rd.mac_address AND du.timestamp >= ?), 0) AS monthly_used,
+                    EXISTS(SELECT 1 FROM quota_bypasses WHERE mac_address = rd.mac_address) AS warning_bypassed
                 FROM registered_devices rd
                 JOIN users u ON rd.username = u.username
                 LEFT JOIN user_groups ug ON u.group_id = ug.id
@@ -145,24 +146,42 @@ class WebServerHandler(BaseHTTPRequestHandler):
             conn.close()
             
             if row:
-                d_limit, m_limit, d_used, m_used = row
-                if d_limit is not None and d_used >= d_limit:
-                    return True, f"Daily limit of {format_bytes(d_limit)} exceeded (Used: {format_bytes(d_used)})"
-                if m_limit is not None and m_used >= m_limit:
-                    return True, f"Monthly limit of {format_bytes(m_limit)} exceeded (Used: {format_bytes(m_used)})"
+                d_limit, m_limit, d_used, m_used, warning_bypassed = row
+                # Check 100% daily
+                if d_limit is not None and d_limit > 0 and d_used >= d_limit:
+                    return True, f"Daily limit of {format_bytes(d_limit)} exceeded (Used: {format_bytes(d_used)})", False
+                # Check 100% monthly
+                if m_limit is not None and m_limit > 0 and m_used >= m_limit:
+                    return True, f"Monthly limit of {format_bytes(m_limit)} exceeded (Used: {format_bytes(m_used)})", False
+                # Check 80% daily
+                if d_limit is not None and d_limit > 0 and d_used >= d_limit * 0.8 and not warning_bypassed:
+                    return True, f"You have reached {int((d_used/d_limit)*100)}% of your daily quota ({format_bytes(d_used)} of {format_bytes(d_limit)}).", True
+                # Check 80% monthly
+                if m_limit is not None and m_limit > 0 and m_used >= m_limit * 0.8 and not warning_bypassed:
+                    return True, f"You have reached {int((m_used/m_limit)*100)}% of your monthly quota ({format_bytes(m_used)} of {format_bytes(m_limit)}).", True
         except Exception as e:
             print(f"[web] Error checking limits: {e}")
-        return False, ""
+        return False, "", False
 
-    def serve_limited_page(self, reason):
+    def serve_limited_page(self, reason, show_skip=False, mac=""):
         self.send_response(200)
         self.send_header("Content-Type", "text/html")
         self.end_headers()
+        
+        skip_button_html = ""
+        if show_skip and mac:
+            skip_button_html = f"""
+            <div style="margin-top:20px; border-top:1px solid #ccc; padding-top:15px; text-align:center;">
+                <p style="font-size:13px; color:#555;">You can bypass this warning temporarily and continue using the internet up to 100% of your quota.</p>
+                <a href="/api/bypass_warning?mac={mac}" style="display: inline-block; background: #6366f1; color: #fff; text-decoration: none; padding: 10px 20px; border-radius: 6px; font-weight: bold; font-family: monospace; font-size:14px; border:1px solid rgba(0,0,0,0.1); box-shadow: 2px 2px 0px #000; transition: background 0.2s;">SKIP WARNING & CONTINUE</a>
+            </div>
+            """
+            
         html = f"""<!DOCTYPE html>
 <html>
 <head>
     <meta charset="utf-8">
-    <title>Usage Limited</title>
+    <title>Usage Warning / Limited</title>
     <style>
         body {{ font-family: monospace; background: #fafafa; color: #111; padding: 40px; text-align: center; }}
         .container {{ max-width: 450px; margin: 0 auto; background: #fff; border: 1px solid #ccc; padding: 25px; text-align: left; box-shadow: 2px 2px 0px #000; }}
@@ -173,12 +192,13 @@ class WebServerHandler(BaseHTTPRequestHandler):
 </head>
 <body>
     <div class="container">
-        <h2>Usage Limited</h2>
-        <p>Access to the internet has been temporarily restricted for this device.</p>
+        <h2>Usage Restriction</h2>
+        <p>Access to the internet has been restricted for this device due to quota limits.</p>
         <div class="reason">
-            <strong>Reason:</strong> {reason}
+            <strong>Warning/Limit:</strong> {reason}
         </div>
-        <p>Please contact the network administrator to request a limit increase or change your group package.</p>
+        {skip_button_html}
+        <p style="font-size:12px; color:#777; margin-top:20px;">Please contact the network administrator to request a limit increase or buy a monthly addon package.</p>
     </div>
 </body>
 </html>"""
@@ -201,9 +221,9 @@ class WebServerHandler(BaseHTTPRequestHandler):
             return
 
         if registered_user and not is_local:
-            is_limited, reason = self.check_device_limits(client_ip, client_mac)
+            is_limited, reason, show_skip = self.check_device_limits(client_ip, client_mac)
             if is_limited:
-                self.serve_limited_page(reason)
+                self.serve_limited_page(reason, show_skip, client_mac)
                 return
 
         if self.path == "/":
@@ -227,6 +247,21 @@ class WebServerHandler(BaseHTTPRequestHandler):
                     conn.close()
                 except Exception:
                     pass
+            self.send_response(303)
+            self.send_header("Location", "/")
+            self.end_headers()
+        elif self.path.startswith("/api/bypass_warning"):
+            params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            mac = normalize_mac(params.get('mac', [''])[0].strip())
+            if mac:
+                try:
+                    conn = sqlite3.connect(DB_PATH)
+                    cursor = conn.cursor()
+                    cursor.execute("INSERT OR REPLACE INTO quota_bypasses (mac_address) VALUES (?);", (mac,))
+                    conn.commit()
+                    conn.close()
+                except Exception as e:
+                    print(f"Error inserting bypass: {e}")
             self.send_response(303)
             self.send_header("Location", "/")
             self.end_headers()
@@ -437,6 +472,57 @@ class WebServerHandler(BaseHTTPRequestHandler):
                     subprocess.run("systemctl restart dnsmasq", shell=True)
                 except Exception as e:
                     print(f"Error writing static reservation: {e}")
+            self.send_response(303)
+            self.send_header("Location", "/")
+            self.end_headers()
+            
+        elif self.path == "/users/configure_limits":
+            username = params.get('username', [''])[0].strip()
+            daily_gb_str = params.get('daily_gb', [''])[0].strip()
+            monthly_gb_str = params.get('monthly_gb', [''])[0].strip()
+            suggested_daily_gb_str = params.get('suggested_daily_gb', [''])[0].strip()
+            suggested_monthly_gb_str = params.get('suggested_monthly_gb', [''])[0].strip()
+            
+            daily_bytes = int(float(daily_gb_str) * 1024 * 1024 * 1024) if daily_gb_str else None
+            monthly_bytes = int(float(monthly_gb_str) * 1024 * 1024 * 1024) if monthly_gb_str else None
+            suggested_daily_bytes = int(float(suggested_daily_gb_str) * 1024 * 1024 * 1024) if suggested_daily_gb_str else None
+            suggested_monthly_bytes = int(float(suggested_monthly_gb_str) * 1024 * 1024 * 1024) if suggested_monthly_gb_str else None
+            
+            if username:
+                try:
+                    conn = sqlite3.connect(DB_PATH)
+                    cursor = conn.cursor()
+                    cursor.execute("""
+                        UPDATE users 
+                        SET daily_limit_bytes = ?, monthly_limit_bytes = ?, 
+                            suggested_daily_limit_bytes = ?, suggested_monthly_limit_bytes = ?
+                        WHERE username = ?;
+                    """, (daily_bytes, monthly_bytes, suggested_daily_bytes, suggested_monthly_bytes, username))
+                    conn.commit()
+                    conn.close()
+                except Exception as e:
+                    print(f"Error configuring user limits: {e}")
+            self.send_response(303)
+            self.send_header("Location", "/")
+            self.end_headers()
+
+        elif self.path == "/users/buy_addon":
+            username = params.get('username', [''])[0].strip()
+            addon_gb = float(params.get('addon_gb', [0])[0])
+            addon_bytes = int(addon_gb * 1024 * 1024 * 1024)
+            
+            if username and addon_bytes > 0:
+                try:
+                    conn = sqlite3.connect(DB_PATH)
+                    cursor = conn.cursor()
+                    cursor.execute("""
+                        INSERT INTO user_addons (username, addon_bytes)
+                        VALUES (?, ?);
+                    """, (username, addon_bytes))
+                    conn.commit()
+                    conn.close()
+                except Exception as e:
+                    print(f"Error buying addon: {e}")
             self.send_response(303)
             self.send_header("Location", "/")
             self.end_headers()
@@ -748,10 +834,32 @@ class WebServerHandler(BaseHTTPRequestHandler):
                     'monthly': format_bytes(ml) if ml else "Unlimited"
                 })
                 
-            # Fetch users
-            cursor.execute("SELECT u.username, g.name, g.id FROM users u LEFT JOIN user_groups g ON u.group_id = g.id;")
-            for username, gname, gid in cursor.fetchall():
-                users_list.append({'username': username, 'group_name': gname or "None", 'group_id': gid})
+            # Fetch users with limits, suggested limits, and addons
+            cursor.execute("""
+                SELECT 
+                    u.username, 
+                    g.name, 
+                    g.id,
+                    u.daily_limit_bytes,
+                    u.monthly_limit_bytes,
+                    u.suggested_daily_limit_bytes,
+                    u.suggested_monthly_limit_bytes,
+                    COALESCE((SELECT SUM(addon_bytes) FROM user_addons WHERE username = u.username), 0) AS total_addons
+                FROM users u 
+                LEFT JOIN user_groups g ON u.group_id = g.id;
+            """)
+            for row in cursor.fetchall():
+                username, gname, gid, dl, ml, sdl, sml, addons = row
+                users_list.append({
+                    'username': username,
+                    'group_name': gname or "None",
+                    'group_id': gid,
+                    'daily_limit': format_bytes(dl) if dl else "Group Default",
+                    'monthly_limit': format_bytes(ml) if ml else "Group Default",
+                    'suggested_daily': format_bytes(sdl) if sdl else "None",
+                    'suggested_monthly': format_bytes(sml) if sml else "None",
+                    'addons': format_bytes(addons) if addons else "0 B"
+                })
             
             # Fetch registered devices
             cursor.execute("SELECT mac_address, ip_address, username, registered_at, device_name FROM registered_devices;")
@@ -882,8 +990,12 @@ class WebServerHandler(BaseHTTPRequestHandler):
 
         user_rows_html = "".join([f"""
         <tr>
-            <td>{u['username']}</td>
+            <td><strong>{u['username']}</strong></td>
             <td>{u['group_name']}</td>
+            <td>{u['daily_limit']}</td>
+            <td>{u['monthly_limit']}</td>
+            <td>{u['suggested_daily']} / {u['suggested_monthly']}</td>
+            <td>{u['addons']}</td>
         </tr>""" for u in users_list])
 
         active_leases_html = "".join([f"""
@@ -1175,16 +1287,72 @@ class WebServerHandler(BaseHTTPRequestHandler):
                 </div>
 
                 <div class="card">
+                    <h2>Configure User Limits & Bucket</h2>
+                    <form method="POST" action="/users/configure_limits">
+                        <div class="form-group">
+                            <label>Select User</label>
+                            <select name="username" required>
+                                {user_options or '<option value="">No users</option>'}
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label>Custom Daily Limit (GB) &mdash; Leave blank for group default</label>
+                            <input type="number" name="daily_gb" step="any" placeholder="e.g., 5.0">
+                        </div>
+                        <div class="form-group">
+                            <label>Custom Monthly Limit / Bucket (GB) &mdash; Leave blank for group default</label>
+                            <input type="number" name="monthly_gb" step="any" placeholder="e.g., 100.0">
+                        </div>
+                        <div class="form-group">
+                            <label>Suggested Daily Quota (GB) &mdash; Display recommendation</label>
+                            <input type="number" name="suggested_daily_gb" step="any" placeholder="e.g., 3.0">
+                        </div>
+                        <div class="form-group">
+                            <label>Suggested Monthly Quota (GB) &mdash; Display recommendation</label>
+                            <input type="number" name="suggested_monthly_gb" step="any" placeholder="e.g., 50.0">
+                        </div>
+                        <button type="submit" class="btn-submit">Save User Limits</button>
+                    </form>
+                </div>
+
+                <div class="card">
+                    <h2>Buy Bandwidth Addons</h2>
+                    <form method="POST" action="/users/buy_addon">
+                        <div class="form-group">
+                            <label>Select User</label>
+                            <select name="username" required>
+                                {user_options or '<option value="">No users</option>'}
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label>Addon Package</label>
+                            <select name="addon_gb" required>
+                                <option value="1">1 GB Addon</option>
+                                <option value="5">5 GB Addon</option>
+                                <option value="10">10 GB Addon</option>
+                                <option value="50">50 GB Addon</option>
+                                <option value="100">100 GB Addon</option>
+                            </select>
+                        </div>
+                        <button type="submit" class="btn-submit">Purchase Addon</button>
+                    </form>
+                </div>
+
+                <div class="card">
                     <h2>Registered Users</h2>
                     <table>
                         <thead>
                             <tr>
                                 <th>Username</th>
                                 <th>Assigned Group</th>
+                                <th>Custom Daily</th>
+                                <th>Custom Monthly</th>
+                                <th>Suggested D/M</th>
+                                <th>Addons</th>
                             </tr>
                         </thead>
                         <tbody>
-                            {user_rows_html or '<tr><td colspan="2" style="text-align:center;">No users registered yet.</td></tr>'}
+                            {user_rows_html or '<tr><td colspan="6" style="text-align:center;">No users registered yet.</td></tr>'}
                         </tbody>
                     </table>
                 </div>
