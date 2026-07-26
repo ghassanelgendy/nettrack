@@ -79,6 +79,18 @@ def init_firewall():
 
 last_allowed_ips = set()
 
+def get_billing_start():
+    import datetime
+    today = datetime.date.today()
+    if today.day >= 28:
+        start_date = today.replace(day=28)
+    else:
+        if today.month == 1:
+            start_date = today.replace(year=today.year - 1, month=12, day=28)
+        else:
+            start_date = today.replace(month=today.month - 1, day=28)
+    return start_date.strftime('%Y-%m-%d 00:00:00')
+
 def update_allowed_ips():
     global last_allowed_ips
     import datetime
@@ -91,7 +103,7 @@ def update_allowed_ips():
         conn.commit()
         
         today_start = datetime.date.today().strftime('%Y-%m-%d 00:00:00')
-        month_start = datetime.date.today().replace(day=1).strftime('%Y-%m-%d 00:00:00')
+        month_start = get_billing_start()
         
         # Get all registered devices along with their usage and effective limits
         # Effective daily limit: u.daily_limit_bytes if set, else ug.daily_limit_bytes
