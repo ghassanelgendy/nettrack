@@ -44,6 +44,11 @@ Instead of manual entries, suggested daily and monthly quotas are dynamically ca
 - **Suggested Monthly:** Average daily usage * 30 * 1.5.
 - These suggestions update dynamically on the dashboard to guide the administrator when adjusting quotas.
 
+### Asynchronous AJAX Forms & Collapsible UI
+To optimize admin workflows, the dashboard runs entirely asynchronously without full-page reloads:
+- **AJAX Forms & Button Actions:** Intercepts form submissions and API button clicks (such as clearing dynamic leases, static reservations, or de-authorizing devices) and submits them via background `fetch` requests. Upon completion, a toast message is displayed and the relevant dashboard cards are dynamically updated using a DOMParser wrapper swap.
+- **Collapsible User Sections:** Clicking on any user header row in the "Authorized Local Devices" table expands or collapses the list of devices belonging to that user. The collapsed state is persisted across dashboard updates.
+
 ---
 
 ## 2. Database Schema
