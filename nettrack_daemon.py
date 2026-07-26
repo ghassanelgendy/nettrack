@@ -69,38 +69,52 @@ def parse_nethogs():
         for line in proc.stdout:
             # Lines look like:
             # PROGRAM/PID/UID   SENT_KB/s   RECV_KB/s
-            # e.g., /usr/bin/python3/12345/1000   1.2   4.5
+            # Or with command line arguments containing spaces:
+            # /usr/bin/chrome --type=utility .../5398/1000   0.0128906   0.0128906
+            if line.startswith("Refreshing"):
+                continue
+                
             parts = line.strip().split()
             if len(parts) < 3:
                 continue
             
-            prog_path = parts[0]
-            if "/" not in prog_path or prog_path.startswith("Refreshing"):
-                continue
-                
+            # The traffic values are always the last two items
             try:
-                # Extract program name/path (ignoring PID and UID at the end)
-                # Format is typically: path/PID/UID
-                subparts = prog_path.split('/')
-                if len(subparts) >= 3:
-                    # Reconstruct path and get binary name
-                    bin_path = "/".join(subparts[:-2])
-                    prog_name = os.path.basename(bin_path) or bin_path
-                else:
-                    prog_name = prog_path
-                
-                # Nethogs outputs KB/s. Convert to bytes (assuming 1s interval)
-                sent_bytes = int(float(parts[1]) * 1024)
-                recv_bytes = int(float(parts[2]) * 1024)
-                
-                if sent_bytes > 0 or recv_bytes > 0:
-                    with lock:
-                        if prog_name not in stats_accumulator:
-                            stats_accumulator[prog_name] = {'sent': 0, 'received': 0}
-                        stats_accumulator[prog_name]['sent'] += sent_bytes
-                        stats_accumulator[prog_name]['received'] += recv_bytes
-            except Exception:
+                sent_bytes = int(float(parts[-2]) * 1024)
+                recv_bytes = int(float(parts[-1]) * 1024)
+            except ValueError:
                 continue
+                
+            if sent_bytes <= 0 and recv_bytes <= 0:
+                continue
+                
+            # The program command line + PID/UID is everything before the last two items
+            full_cmd = " ".join(parts[:-2])
+            if not full_cmd or full_cmd.startswith("unknown TCP"):
+                prog_name = "unknown TCP"
+            else:
+                try:
+                    # Strip /PID/UID from the end of the command if present
+                    # Format: cmd/PID/UID
+                    subparts = full_cmd.rsplit('/', 2)
+                    if len(subparts) == 3 and subparts[1].isdigit() and subparts[2].isdigit():
+                        cmd_without_pid = subparts[0]
+                    else:
+                        cmd_without_pid = full_cmd
+                    
+                    # Extract the executable path (first word) and get its basename
+                    exe_path = cmd_without_pid.split()[0]
+                    prog_name = os.path.basename(exe_path) or exe_path
+                    # Strip any trailing colons (e.g. sshd-session:)
+                    prog_name = prog_name.rstrip(':')
+                except Exception:
+                    prog_name = "unknown"
+            
+            with lock:
+                if prog_name not in stats_accumulator:
+                    stats_accumulator[prog_name] = {'sent': 0, 'received': 0}
+                stats_accumulator[prog_name]['sent'] += sent_bytes
+                stats_accumulator[prog_name]['received'] += recv_bytes
     except KeyboardInterrupt:
         pass
     finally:
