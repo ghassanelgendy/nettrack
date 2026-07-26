@@ -35,6 +35,7 @@ A global shared bandwidth pool represents the total ISP package limit:
 - **Allocation Share:** The dashboard displays what percentage of the Global Pool is allocated to each user based on their monthly limits and addons.
 - **Over-allocation Warning:** Calculates and warns the admin if the sum of distributed user quotas exceeds the Global Pool.
 - **Remaining Pool Tracker:** Shows how much of the Global Pool remains for the current cycle based on real-time consumption.
+- **Automatic Pool Redistribution:** If the sum of all monthly allocations exceeds the Global ISP Pool, the system dynamically recalculates default group limits. Users with custom limits (specific allocations) and addons keep their limits. The remaining pool space is redistributed relatively to the default group users based on their original group limits. Default users' monthly limits are marked as "(Redistributed)" on the dashboard and enforced at runtime.
 
 ### Dynamic Heuristic Suggestions
 Instead of manual entries, suggested daily and monthly quotas are dynamically calculated from actual usage logs:
