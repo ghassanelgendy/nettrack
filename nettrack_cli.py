@@ -105,6 +105,18 @@ def get_static_reservations():
         pass
     return reservations
 
+def get_billing_start():
+    import datetime
+    today = datetime.date.today()
+    if today.day >= 28:
+        start_date = today.replace(day=28)
+    else:
+        if today.month == 1:
+            start_date = today.replace(year=today.year - 1, month=12, day=28)
+        else:
+            start_date = today.replace(month=today.month - 1, day=28)
+    return start_date.strftime('%Y-%m-%d 00:00:00')
+
 class WebServerHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         return
@@ -121,18 +133,6 @@ class WebServerHandler(BaseHTTPRequestHandler):
         except Exception:
             pass
         return None
-
-def get_billing_start():
-    import datetime
-    today = datetime.date.today()
-    if today.day >= 28:
-        start_date = today.replace(day=28)
-    else:
-        if today.month == 1:
-            start_date = today.replace(year=today.year - 1, month=12, day=28)
-        else:
-            start_date = today.replace(month=today.month - 1, day=28)
-    return start_date.strftime('%Y-%m-%d 00:00:00')
 
     def check_device_limits(self, ip, mac):
         try:
