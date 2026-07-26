@@ -91,10 +91,77 @@ def get_billing_start():
             start_date = today.replace(month=today.month - 1, day=28)
     return start_date.strftime('%Y-%m-%d 00:00:00')
 
+def get_effective_user_limits():
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        
+        # Fetch global pool
+        cursor.execute("SELECT value FROM settings WHERE key = 'global_pool_bytes';")
+        row = cursor.fetchone()
+        global_pool = int(row[0]) if row else 1073741824000
+        
+        # Fetch all users with their group default limits, custom limits, and addons
+        cursor.execute("""
+            SELECT 
+                u.username,
+                ug.monthly_limit_bytes AS group_monthly,
+                u.monthly_limit_bytes AS custom_monthly,
+                COALESCE((SELECT SUM(addon_bytes) FROM user_addons WHERE username = u.username), 0) AS addons
+            FROM users u
+            LEFT JOIN user_groups ug ON u.group_id = ug.id;
+        """)
+        users_data = cursor.fetchall()
+        conn.close()
+        
+        specific_users = {}
+        default_users = {}
+        total_specific = 0
+        total_default_original = 0
+        sum_group_defaults = 0
+        
+        for username, group_monthly, custom_monthly, addons in users_data:
+            group_monthly = group_monthly or 0
+            if custom_monthly is not None:
+                specific_users[username] = (custom_monthly, addons)
+                total_specific += custom_monthly + addons
+            else:
+                default_users[username] = (group_monthly, addons)
+                total_default_original += group_monthly + addons
+                sum_group_defaults += group_monthly
+                
+        total_allocated = total_specific + total_default_original
+        effective_limits = {}
+        
+        if total_allocated > global_pool:
+            # Redistribute remaining pool to default users relatively
+            remaining_pool = max(global_pool - total_specific, 0)
+            
+            for username, (custom_monthly, addons) in specific_users.items():
+                effective_limits[username] = custom_monthly + addons
+                
+            for username, (group_monthly, addons) in default_users.items():
+                if sum_group_defaults > 0:
+                    share = (group_monthly / sum_group_defaults) * remaining_pool
+                else:
+                    share = 0
+                effective_limits[username] = int(share) + addons
+        else:
+            for username, group_monthly, custom_monthly, addons in users_data:
+                base = custom_monthly if custom_monthly is not None else (group_monthly or 0)
+                effective_limits[username] = base + addons
+                
+        return effective_limits
+    except Exception as e:
+        print(f"[portal] Error calculating effective limits: {e}")
+        return {}
+
 def update_allowed_ips():
     global last_allowed_ips
     import datetime
     try:
+        effective_monthly_limits = get_effective_user_limits()
+        
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         
@@ -105,14 +172,12 @@ def update_allowed_ips():
         today_start = datetime.date.today().strftime('%Y-%m-%d 00:00:00')
         month_start = get_billing_start()
         
-        # Get all registered devices along with their usage and effective limits
-        # Effective daily limit: u.daily_limit_bytes if set, else ug.daily_limit_bytes
-        # Effective monthly limit: (u.monthly_limit_bytes if set, else ug.monthly_limit_bytes) + sum of user addons
+        # Get all registered devices along with their usage and daily limits
         cursor.execute("""
             SELECT 
                 rd.ip_address,
+                rd.username,
                 COALESCE(u.daily_limit_bytes, ug.daily_limit_bytes) AS d_limit,
-                (COALESCE(u.monthly_limit_bytes, ug.monthly_limit_bytes) + COALESCE((SELECT SUM(addon_bytes) FROM user_addons WHERE username = u.username), 0)) AS m_limit,
                 COALESCE((SELECT SUM(du.sent_bytes + du.received_bytes) FROM device_usage du WHERE du.mac_address = rd.mac_address AND du.timestamp >= ?), 0) AS d_used,
                 COALESCE((SELECT SUM(du.sent_bytes + du.received_bytes) FROM device_usage du WHERE du.mac_address = rd.mac_address AND du.timestamp >= ?), 0) AS m_used,
                 EXISTS(SELECT 1 FROM quota_bypasses WHERE mac_address = rd.mac_address) AS warning_bypassed
@@ -122,7 +187,8 @@ def update_allowed_ips():
         """, (today_start, month_start))
         
         current_ips = set()
-        for ip, d_limit, m_limit, d_used, m_used, warning_bypassed in cursor.fetchall():
+        for ip, username, d_limit, d_used, m_used, warning_bypassed in cursor.fetchall():
+            m_limit = effective_monthly_limits.get(username)
             # If no limit is set (NULL or 0/None), they are unlimited.
             # Otherwise:
             # 1. 100% block if usage exceeds limit.
