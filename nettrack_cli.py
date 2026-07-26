@@ -1128,10 +1128,12 @@ class WebServerHandler(BaseHTTPRequestHandler):
 
         device_rows = []
         for user in sorted_users:
+            user_safe = "".join(c for c in user if c.isalnum())
             # Header row for the user group
             device_rows.append(f"""
-            <tr style="background: rgba(99, 102, 241, 0.15); border-left: 4px solid #6366f1;">
+            <tr class="user-header" data-user="{user_safe}" style="cursor: pointer; background: rgba(99, 102, 241, 0.15); border-left: 4px solid #6366f1; user-select: none;">
                 <td colspan="5" style="padding: 10px 16px; font-weight: bold; color: #a5b4fc;">
+                    <span class="toggle-icon" style="display:inline-block; width:12px; margin-right:5px;">▼</span>
                     User: {user} &mdash; Total Usage: {format_bytes(user_totals[user])}
                 </td>
             </tr>
@@ -1139,12 +1141,12 @@ class WebServerHandler(BaseHTTPRequestHandler):
             # Device rows under this user
             for dev in user_to_devices[user]:
                 device_rows.append(f"""
-                <tr>
+                <tr class="device-row user-{user_safe}">
                     <td style="padding-left: 30px;">
                         <span style="font-weight:bold; color:#fff;">{dev['name']}</span><br>
                         <span style="font-size:12px; color:rgba(255,255,255,0.4)">{dev['ip']}</span>
                     </td>
-                    <td><code style="background: rgba(255,255,255,0.1); padding: 2px 6px; border-radius: 4px; cursor: pointer; vertical-align: middle;" title="Double-click to de-authorize" ondblclick="if(confirm('Are you sure you want to de-authorize this device?')){{ window.location.href='/api/deassociate?mac={dev['mac']}'; }}">{dev['mac']}</code></td>
+                    <td><code style="background: rgba(255,255,255,0.1); padding: 2px 6px; border-radius: 4px; cursor: pointer; vertical-align: middle;" title="Double-click to de-authorize" ondblclick="if(confirm('Are you sure you want to de-authorize this device?')){{ performApiAction('/api/deassociate?mac={dev['mac']}'); }}">{dev['mac']}</code></td>
                     <td>{dev['user']}</td>
                     <td>
                         <div>{dev['sent']} / {dev['recv']}</div>
@@ -1157,7 +1159,7 @@ class WebServerHandler(BaseHTTPRequestHandler):
                             <input type="text" name="name" placeholder="Rename..." required style="padding:4px 8px; font-size:11px; width:80px; background:rgba(0,0,0,0.3); color:#fff; border:1px solid rgba(255,255,255,0.1); border-radius:4px; vertical-align:middle;">
                             <input type="submit" value="Rename" style="padding:4px 8px; font-size:11px; background:#6366f1; color:#fff; border:none; border-radius:4px; cursor:pointer; vertical-align:middle;">
                         </form>
-                        <a href="/api/dhcp/preserve_device?mac={dev['mac']}&ip={dev['ip']}&name={urllib.parse.quote(dev['name'])}" style="display:inline-block; font-size:11px; padding:5px 10px; background:#10b981; color:#fff; border:none; border-radius:4px; text-decoration:none; margin-right:5px; font-weight:bold; cursor:pointer; vertical-align:middle;">Preserve IP</a>
+                        <button onclick="performApiAction('/api/dhcp/preserve_device?mac={dev['mac']}&ip={dev['ip']}&name={urllib.parse.quote(dev['name'])}')" style="display:inline-block; font-size:11px; padding:5px 10px; background:#10b981; color:#fff; border:none; border-radius:4px; font-weight:bold; cursor:pointer; vertical-align:middle; font-family:monospace;">Preserve IP</button>
                     </td>
                 </tr>""")
 
@@ -1195,7 +1197,7 @@ class WebServerHandler(BaseHTTPRequestHandler):
             <td><strong>{l['hostname']}</strong></td>
             <td><code>{l['mac']}</code></td>
             <td><code>{l['ip']}</code></td>
-            <td><a href="/api/dhcp/clear_lease?mac={l['mac']}" class="btn-danger" style="padding:4px 8px; font-size:11px;">Clear</a></td>
+            <td><button onclick="performApiAction('/api/dhcp/clear_lease?mac={l['mac']}')" class="btn-danger" style="padding:4px 8px; font-size:11px; cursor:pointer; font-family:monospace;">Clear</button></td>
         </tr>""" for l in active_leases])
 
         static_leases_html = "".join([f"""
@@ -1203,7 +1205,7 @@ class WebServerHandler(BaseHTTPRequestHandler):
             <td><strong>{r['hostname']}</strong></td>
             <td><code>{r['mac']}</code></td>
             <td><code>{r['ip']}</code></td>
-            <td><a href="/api/dhcp/remove?mac={r['mac']}" class="btn-danger" style="padding:4px 8px; font-size:11px;">Remove</a></td>
+            <td><button onclick="performApiAction('/api/dhcp/remove?mac={r['mac']}')" class="btn-danger" style="padding:4px 8px; font-size:11px; cursor:pointer; font-family:monospace;">Remove</button></td>
         </tr>""" for r in static_reservations])
 
         group_options = "".join([f'<option value="{g["id"]}">{g["name"]}</option>' for g in groups_list])
@@ -1323,9 +1325,45 @@ class WebServerHandler(BaseHTTPRequestHandler):
             font-weight: bold;
             color: #fff;
         }}
+        
+        /* Collapsible User Headers */
+        .user-header .toggle-icon {{
+            display: inline-block;
+            transition: transform 0.2s ease;
+        }}
+        .user-header.collapsed .toggle-icon {{
+            transform: rotate(-90deg);
+        }}
+        
+        /* Sleek Toast Alerts */
+        #toast {{
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            background: #10b981;
+            color: #fff;
+            padding: 12px 24px;
+            border-radius: 8px;
+            font-weight: 600;
+            font-size: 13px;
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.3);
+            transform: translateY(100px);
+            opacity: 0;
+            transition: transform 0.3s cubic-bezier(0.16, 1, 0.3, 1), opacity 0.3s ease;
+            z-index: 10000;
+            border: 1px solid rgba(255,255,255,0.1);
+        }}
+        #toast.error {{
+            background: #ef4444;
+        }}
+        #toast.show {{
+            transform: translateY(0);
+            opacity: 1;
+        }}
     </style>
 </head>
 <body>
+    <div id="toast">Saved successfully!</div>
     <div class="header">
         <h1>NetTrack Portal</h1>
         <div>
@@ -1335,7 +1373,7 @@ class WebServerHandler(BaseHTTPRequestHandler):
     </div>
     <div class="container">
         <!-- Usage Metrics Counters -->
-        <div class="stats-grid">
+        <div class="stats-grid" id="stats-grid-container">
             <div class="stat-card today">
                 <span class="label">Today's Usage (Overall)</span>
                 <span class="value">{format_bytes(overall_today)}</span>
@@ -1362,7 +1400,7 @@ class WebServerHandler(BaseHTTPRequestHandler):
 
         <div class="grid">
             <div>
-                <div class="card">
+                <div class="card" id="devices-card-container">
                     <h2>Authorized Local Devices</h2>
                     <table>
                         <thead>
@@ -1381,7 +1419,7 @@ class WebServerHandler(BaseHTTPRequestHandler):
                 </div>
 
                 <!-- DHCP Administration UI -->
-                <div class="card">
+                <div class="card" id="leases-card-container">
                     <h2>Dynamic DHCP Client Leases</h2>
                     <table>
                         <thead>
@@ -1398,7 +1436,7 @@ class WebServerHandler(BaseHTTPRequestHandler):
                     </table>
                 </div>
 
-                <div class="card">
+                <div class="card" id="reservations-card-container">
                     <h2>Static IP DHCP Reservations (Preserved IPs)</h2>
                     <table>
                         <thead>
@@ -1415,7 +1453,7 @@ class WebServerHandler(BaseHTTPRequestHandler):
                     </table>
                 </div>
                 
-                <div class="card">
+                <div class="card" id="groups-card-container">
                     <h2>Package / User Groups</h2>
                     <table>
                         <thead>
@@ -1503,7 +1541,7 @@ class WebServerHandler(BaseHTTPRequestHandler):
                     </form>
                 </div>
 
-                <div class="card">
+                <div class="card" id="distribution-card-container">
                     <h2>Global Pool Distribution Breakdown</h2>
                     <table>
                         <thead>
@@ -1566,7 +1604,7 @@ class WebServerHandler(BaseHTTPRequestHandler):
                     </form>
                 </div>
 
-                <div class="card">
+                <div class="card" id="users-card-container">
                     <h2>Registered Users</h2>
                     <table>
                         <thead>
@@ -1585,7 +1623,7 @@ class WebServerHandler(BaseHTTPRequestHandler):
                     </table>
                 </div>
 
-                <div class="card">
+                <div class="card" id="processes-card-container">
                     <h2>Server Process Usage</h2>
                     <table>
                         <thead>
@@ -1604,6 +1642,134 @@ class WebServerHandler(BaseHTTPRequestHandler):
             </div>
         </div>
     </div>
+    
+    <script>
+        const collapsedUsers = new Set();
+
+        function showToast(message, isError = false) {{
+            const toast = document.getElementById("toast");
+            toast.textContent = message;
+            toast.className = isError ? "error show" : "show";
+            setTimeout(() => {{
+                toast.classList.remove("show");
+            }}, 3000);
+        }}
+
+        function setupCollapsibleHeaders() {{
+            document.querySelectorAll(".user-header").forEach(header => {{
+                const username = header.getAttribute("data-user");
+                
+                if (collapsedUsers.has(username)) {{
+                    header.classList.add("collapsed");
+                    document.querySelectorAll(`.device-row.user-${{username}}`).forEach(r => r.style.display = "none");
+                }}
+                
+                header.onclick = function() {{
+                    if (collapsedUsers.has(username)) {{
+                        collapsedUsers.delete(username);
+                        header.classList.remove("collapsed");
+                        document.querySelectorAll(`.device-row.user-${{username}}`).forEach(r => r.style.display = "table-row");
+                    }} else {{
+                        collapsedUsers.add(username);
+                        header.classList.add("collapsed");
+                        document.querySelectorAll(`.device-row.user-${{username}}`).forEach(r => r.style.display = "none");
+                    }}
+                }};
+            }});
+        }}
+
+        function refreshDashboard() {{
+            fetch("/")
+            .then(res => res.text())
+            .then(html => {{
+                const parser = new DOMParser();
+                const doc = parser.parseFromString(html, "text/html");
+                
+                const newStats = doc.getElementById("stats-grid-container");
+                if (newStats) document.getElementById("stats-grid-container").innerHTML = newStats.innerHTML;
+                
+                const targets = [
+                    "devices-card-container",
+                    "leases-card-container",
+                    "reservations-card-container",
+                    "groups-card-container",
+                    "distribution-card-container",
+                    "users-card-container",
+                    "processes-card-container"
+                ];
+                
+                targets.forEach(id => {{
+                    const fresh = doc.getElementById(id);
+                    if (fresh) document.getElementById(id).innerHTML = fresh.innerHTML;
+                }});
+                
+                const userSelects = document.querySelectorAll("select[name='username']");
+                const freshUserSelect = doc.querySelector("select[name='username']");
+                if (freshUserSelect) {{
+                    userSelects.forEach(select => {{
+                        const val = select.value;
+                        select.innerHTML = freshUserSelect.innerHTML;
+                        select.value = val;
+                    }});
+                }}
+                
+                const groupSelects = document.querySelectorAll("select[name='group_id']");
+                const freshGroupSelect = doc.querySelector("select[name='group_id']");
+                if (freshGroupSelect) {{
+                    groupSelects.forEach(select => {{
+                        const val = select.value;
+                        select.innerHTML = freshGroupSelect.innerHTML;
+                        select.value = val;
+                    }});
+                }}
+                
+                setupCollapsibleHeaders();
+            }})
+            .catch(err => console.error("Error refreshing dashboard:", err));
+        }}
+
+        function performApiAction(url) {{
+            if (url.includes("deassociate") && !confirm("Are you sure you want to de-authorize this device?")) {{
+                return;
+            }}
+            fetch(url)
+            .then(response => {{
+                if (response.ok) {{
+                    showToast("Action completed successfully!");
+                    refreshDashboard();
+                }} else {{
+                    showToast("Error processing action.", true);
+                }}
+            }})
+            .catch(err => showToast("Network error: " + err, true));
+        }}
+
+        document.addEventListener("submit", function(e) {{
+            const form = e.target;
+            e.preventDefault();
+            
+            fetch(form.action, {{
+                method: "POST",
+                body: new URLSearchParams(new FormData(form))
+            }})
+            .then(response => {{
+                if (response.ok) {{
+                    showToast("Saved successfully!");
+                    form.querySelectorAll("input[type='text'], input[type='number']").forEach(input => {{
+                        if (input.name !== "global_pool_gb" && !input.readOnly) {{
+                            input.value = "";
+                        }}
+                    }});
+                    refreshDashboard();
+                }} else {{
+                    showToast("Error submitting form.", true);
+                }}
+            }})
+            .catch(err => showToast("Network error: " + err, true));
+        }});
+
+        setupCollapsibleHeaders();
+    </script>
 </body>
 </html>"""
         self.wfile.write(html.encode("utf-8"))
