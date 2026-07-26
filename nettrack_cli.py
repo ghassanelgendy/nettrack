@@ -975,6 +975,18 @@ class WebServerHandler(BaseHTTPRequestHandler):
             """)
             total_allocated_bytes = cursor.fetchone()[0] or 0
 
+            # Fetch total assigned specifically to users (excluding group defaults)
+            cursor.execute("""
+                SELECT SUM(
+                    COALESCE(u.monthly_limit_bytes, 0) + 
+                    COALESCE((SELECT SUM(addon_bytes) FROM user_addons WHERE username = u.username), 0)
+                ) FROM users u 
+                WHERE u.monthly_limit_bytes IS NOT NULL;
+            """)
+            sum_specific_user_bytes = cursor.fetchone()[0] or 0
+            specific_remaining_bytes = max(global_pool_bytes - sum_specific_user_bytes, 0)
+            specific_remaining_gb = specific_remaining_bytes / (1024 * 1024 * 1024)
+
             # Get effective redistributed limits
             effective_limits = get_effective_user_limits()
 
@@ -1557,7 +1569,7 @@ class WebServerHandler(BaseHTTPRequestHandler):
                     </table>
                 </div>
 
-                <div class="card">
+                <div class="card" id="configure-limits-card-container">
                     <h2>Configure User Limits & Bucket</h2>
                     <form method="POST" action="/users/configure_limits">
                         <div class="form-group">
@@ -1573,6 +1585,9 @@ class WebServerHandler(BaseHTTPRequestHandler):
                         <div class="form-group">
                             <label>Custom Monthly Limit / Bucket (GB) &mdash; Leave blank for group default</label>
                             <input type="number" name="monthly_gb" step="any" placeholder="e.g., 100.0">
+                            <small style="color: rgba(255,255,255,0.5); display:block; margin-top:5px;">
+                                Remaining unassigned pool capacity: <strong>{specific_remaining_gb:.2f} GB</strong> (counting custom user limits only)
+                            </small>
                         </div>
                         <p style="font-size: 11px; color:#10b981; margin-top:5px; margin-bottom:10px;">
                             * Heuristic suggested quotas are dynamically calculated in the Registered Users table below based on past week usage!
@@ -1694,6 +1709,7 @@ class WebServerHandler(BaseHTTPRequestHandler):
                     "reservations-card-container",
                     "groups-card-container",
                     "distribution-card-container",
+                    "configure-limits-card-container",
                     "users-card-container",
                     "processes-card-container"
                 ];
