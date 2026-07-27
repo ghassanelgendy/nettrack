@@ -54,6 +54,7 @@ To support massive logs (50+ GB) on secondary drives and prevent SSD wear on the
 - **Custom Database Path:** Admin can dynamically configure the file path to `vault.db` from the Web Dashboard. Changing the path automatically restarts the backend daemons to apply the setting. Optionally, the `--vault-db` CLI parameter can be supplied to override settings.
 - **Dynamic Drive Space Protection:** Capping (deletion of old log entries) is disabled by default to retain unlimited packet logs. Capping is only triggered as a safety measure (capping to the last 1,000,000 rows) if the drive containing `vault.db` has less than 10% free space remaining.
 - **Self-Healing Writable Backup Probes:** A background thread executes every 3 days to back up the active `vault.db` transaction-safely. It probes candidate mount points (`/logs`, `/mnt/sdc1`, `/mnt/sda6`, `/mnt/sda5`) by performing temporary write tests, selecting the first writable location (preventing failures if a partition like `/mnt/sdc1` is locked in read-only mode).
+- **Precise Packet Timestamps:** Instead of defaulting to insertion time during bulk database inserts (which caused all packets in a 5-second batch to share the exact same timestamp), the sniffer now captures the precise packet arrival time at reception and saves it directly to the vault.
 
 ---
 
