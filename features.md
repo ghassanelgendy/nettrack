@@ -31,3 +31,7 @@
 ## Collapsible User Device Table Rows
 - **Change:** Clicking user headings in the device list table collapses/expands the associated client device list.
 - **Benefit:** Keeps the device overview screen structured and readable on large deployments.
+
+## Customizable Log Storage Settings & Self-Healing Backups
+- **Change:** Configurable vault database location via Web Dashboard settings with automatic service restarts. Implemented a 3-day SQLite backup loop that probes candidate folders (`/logs`, `/mnt/sdc1`, `/mnt/sda6`, `/mnt/sda5`) by writing temporary files to choose the first writeable drive. Added drive space monitor that disables capping unless free space drops below 10%.
+- **Benefit:** Allows storing massive logs on secondary drives safely without risk of root drive partition exhaustion or write failures on locked drives.
