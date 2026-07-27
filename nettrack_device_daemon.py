@@ -225,6 +225,11 @@ def flush_vault():
                 INSERT INTO raw_traffic (src_mac, src_ip, dst_mac, dst_ip, bytes)
                 VALUES (?, ?, ?, ?, ?);
             """, to_flush)
+            # Cap raw_traffic table size to the last 10,000 entries to prevent database bloat
+            cursor.execute("""
+                DELETE FROM raw_traffic 
+                WHERE id < (SELECT COALESCE(MAX(id), 0) FROM raw_traffic) - 10000;
+            """)
             conn.commit()
             conn.close()
         except Exception as e:
