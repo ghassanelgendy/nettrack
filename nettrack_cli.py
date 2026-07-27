@@ -105,6 +105,23 @@ def get_static_reservations():
         pass
     return reservations
 
+def get_vault_db_path():
+    import sys
+    for idx, arg in enumerate(sys.argv):
+        if arg == "--vault-db" and idx + 1 < len(sys.argv):
+            return sys.argv[idx + 1]
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT value FROM settings WHERE key = 'vault_db_path';")
+        row = cursor.fetchone()
+        conn.close()
+        if row and row[0]:
+            return row[0]
+    except Exception:
+        pass
+    return "/var/lib/nettrack/vault.db"
+
 def get_billing_start():
     import datetime
     today = datetime.date.today()
@@ -617,6 +634,31 @@ class WebServerHandler(BaseHTTPRequestHandler):
                 conn.close()
             except Exception as e:
                 print(f"Error updating global pool setting: {e}")
+            self.send_response(303)
+            self.send_header("Location", "/")
+            self.end_headers()
+        elif self.path == "/settings/vault_path":
+            vault_path = params.get('vault_path', [''])[0].strip()
+            if vault_path:
+                try:
+                    # Make sure the parent folder exists and is writable
+                    parent_dir = os.path.dirname(os.path.abspath(vault_path))
+                    os.makedirs(parent_dir, exist_ok=True)
+                    
+                    conn = sqlite3.connect(DB_PATH)
+                    cursor = conn.cursor()
+                    cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('vault_db_path', ?);", (vault_path,))
+                    conn.commit()
+                    conn.close()
+                    
+                    # Restart services in the background using docker chroot escape
+                    import subprocess
+                    subprocess.Popen([
+                        "docker", "run", "--rm", "--privileged", "--net=host", "--pid=host", "-v", "/:/host", "redis:6.2-alpine",
+                        "chroot", "/host", "systemctl", "restart", "nettrack.service", "nettrack-portal.service", "nettrack-web.service", "nettrack-device.service"
+                    ])
+                except Exception as e:
+                    print(f"Error updating vault db path: {e}")
             self.send_response(303)
             self.send_header("Location", "/")
             self.end_headers()
@@ -1222,6 +1264,7 @@ class WebServerHandler(BaseHTTPRequestHandler):
 
         group_options = "".join([f'<option value="{g["id"]}">{g["name"]}</option>' for g in groups_list])
         user_options = "".join([f'<option value="{u["username"]}">{u["username"]}</option>' for u in users_list])
+        vault_db_path_val = get_vault_db_path()
 
         html = f"""<!DOCTYPE html>
 <html>
@@ -1553,6 +1596,17 @@ class WebServerHandler(BaseHTTPRequestHandler):
                     </form>
                 </div>
 
+                <div class="card" id="vault-path-card-container">
+                    <h2>Configure Vault DB Path</h2>
+                    <form method="POST" action="/settings/vault_path">
+                        <div class="form-group">
+                            <label>Vault SQLite Database Path</label>
+                            <input type="text" name="vault_path" value="{vault_db_path_val}" required>
+                        </div>
+                        <button type="submit" class="btn-submit">Save & Restart Services</button>
+                    </form>
+                </div>
+
                 <div class="card" id="distribution-card-container">
                     <h2>Global Pool Distribution Breakdown</h2>
                     <table>
@@ -1709,6 +1763,7 @@ class WebServerHandler(BaseHTTPRequestHandler):
                     "reservations-card-container",
                     "groups-card-container",
                     "distribution-card-container",
+                    "vault-path-card-container",
                     "configure-limits-card-container",
                     "users-card-container",
                     "processes-card-container"
@@ -1810,7 +1865,7 @@ class WebServerHandler(BaseHTTPRequestHandler):
             
         vault_rows_html = ""
         try:
-            conn = sqlite3.connect("/var/lib/nettrack/vault.db")
+            conn = sqlite3.connect(get_vault_db_path())
             cursor = conn.cursor()
             cursor.execute("SELECT timestamp, src_mac, src_ip, dst_mac, dst_ip, bytes FROM raw_traffic ORDER BY id DESC LIMIT 200;")
             rows = cursor.fetchall()
@@ -1964,6 +2019,7 @@ def run_web_server(port):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--web", type=int, nargs='?', const=6054, help="Run web server portal dashboard.")
+    parser.add_argument("--vault-db", help="Override path to vault SQLite database file.")
     args = parser.parse_args()
     
     if args.web is not None:

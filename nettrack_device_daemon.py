@@ -6,9 +6,94 @@ import sqlite3
 import subprocess
 import threading
 import argparse
+import shutil
 
 DB_PATH = "/var/lib/nettrack/nettrack.db"
-VAULT_DB_PATH = "/var/lib/nettrack/vault.db"
+
+def get_vault_db_path():
+    for idx, arg in enumerate(sys.argv):
+        if arg == "--vault-db" and idx + 1 < len(sys.argv):
+            return sys.argv[idx + 1]
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT value FROM settings WHERE key = 'vault_db_path';")
+        row = cursor.fetchone()
+        conn.close()
+        if row and row[0]:
+            return row[0]
+    except Exception:
+        pass
+    return "/var/lib/nettrack/vault.db"
+
+def get_free_space_percent(path):
+    try:
+        stat = os.statvfs(os.path.dirname(os.path.abspath(path)))
+        free = stat.f_bavail * stat.f_frsize
+        total = stat.f_blocks * stat.f_frsize
+        return (free / total) * 100 if total > 0 else 100
+    except Exception:
+        return 100
+
+def perform_scheduled_backup(active_vault_path):
+    dest_dirs = ["/logs", "/mnt/sdc1", "/mnt/sda6", "/mnt/sda5"]
+    backup_path = None
+    selected_dir = None
+    for dest_dir in dest_dirs:
+        if os.path.exists(dest_dir):
+            test_path = os.path.join(dest_dir, ".backup_test")
+            try:
+                with open(test_path, "w") as f:
+                    f.write("test")
+                os.remove(test_path)
+                backup_path = os.path.join(dest_dir, "vault_backup.db")
+                selected_dir = dest_dir
+                break
+            except Exception:
+                continue
+                
+    if not backup_path:
+        print(f"[device] Backup skipped: no writeable backup destinations found from {dest_dirs}.")
+        return
+        
+    print(f"[device] Starting scheduled backup of {active_vault_path} to {backup_path} (drive: {selected_dir})...")
+    try:
+        src_conn = sqlite3.connect(active_vault_path)
+        dst_conn = sqlite3.connect(f"file:{backup_path}?nolock=1", uri=True)
+        src_conn.backup(dst_conn)
+        dst_conn.close()
+        src_conn.close()
+        print(f"[device] Scheduled backup completed successfully to {backup_path}.")
+        
+        main_conn = sqlite3.connect(DB_PATH)
+        main_cursor = main_conn.cursor()
+        main_cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('last_vault_backup_time', ?);", (str(time.time()),))
+        main_conn.commit()
+        main_conn.close()
+    except Exception as e:
+        print(f"[device] Error during scheduled backup: {e}")
+
+def scheduled_backup_loop():
+    print("[device] Starting scheduled vault database backup loop...", flush=True)
+    while True:
+        # Check every hour
+        time.sleep(3600)
+        try:
+            vault_db_path = get_vault_db_path()
+            if not os.path.exists(vault_db_path):
+                continue
+                
+            main_conn = sqlite3.connect(DB_PATH)
+            main_cursor = main_conn.cursor()
+            main_cursor.execute("SELECT value FROM settings WHERE key = 'last_vault_backup_time';")
+            row = main_cursor.fetchone()
+            main_conn.close()
+            
+            last_backup = float(row[0]) if row else 0.0
+            if time.time() - last_backup >= 259200: # 3 days
+                perform_scheduled_backup(vault_db_path)
+        except Exception as e:
+            print(f"[device] Error in backup loop: {e}", file=sys.stderr, flush=True)
 
 # Accumulator lock
 lock = threading.Lock()
@@ -67,8 +152,9 @@ def get_primary_interface():
 
 def init_vault_db():
     try:
-        os.makedirs("/var/lib/nettrack", exist_ok=True)
-        conn = sqlite3.connect(VAULT_DB_PATH)
+        vault_db_path = get_vault_db_path()
+        os.makedirs(os.path.dirname(os.path.abspath(vault_db_path)), exist_ok=True)
+        conn = sqlite3.connect(vault_db_path)
         cursor = conn.cursor()
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS raw_traffic (
@@ -219,17 +305,22 @@ def flush_vault():
             vault_accumulator.clear()
 
         try:
-            conn = sqlite3.connect(VAULT_DB_PATH)
+            vault_db_path = get_vault_db_path()
+            conn = sqlite3.connect(vault_db_path)
             cursor = conn.cursor()
             cursor.executemany("""
                 INSERT INTO raw_traffic (src_mac, src_ip, dst_mac, dst_ip, bytes)
                 VALUES (?, ?, ?, ?, ?);
             """, to_flush)
-            # Cap raw_traffic table size to the last 10,000 entries to prevent database bloat
-            cursor.execute("""
-                DELETE FROM raw_traffic 
-                WHERE id < (SELECT COALESCE(MAX(id), 0) FROM raw_traffic) - 10000;
-            """)
+            
+            # If disk free space is low (< 10%), cap raw_traffic table to prevent disk exhaustion.
+            # Otherwise, allow it to grow without limits to support massive logs as requested.
+            if get_free_space_percent(vault_db_path) < 10:
+                cursor.execute("""
+                    DELETE FROM raw_traffic 
+                    WHERE id < (SELECT COALESCE(MAX(id), 0) FROM raw_traffic) - 1000000;
+                """)
+                
             conn.commit()
             conn.close()
         except Exception as e:
@@ -320,6 +411,19 @@ def main():
     threading.Thread(target=flush_stats, daemon=True).start()
     threading.Thread(target=flush_vault, daemon=True).start()
     threading.Thread(target=iptables_accounting_loop, daemon=True).start()
+    threading.Thread(target=scheduled_backup_loop, daemon=True).start()
+    
+    # Trigger initial backup if none exists in settings
+    try:
+        main_conn = sqlite3.connect(DB_PATH)
+        main_cursor = main_conn.cursor()
+        main_cursor.execute("SELECT value FROM settings WHERE key = 'last_vault_backup_time';")
+        row = main_cursor.fetchone()
+        main_conn.close()
+        if not row:
+            perform_scheduled_backup(get_vault_db_path())
+    except Exception as e:
+        print(f"[device] Initial backup trigger error: {e}", flush=True)
     
     # Parse tcpdump for Vault connection flow
     parse_tcpdump(iface)
