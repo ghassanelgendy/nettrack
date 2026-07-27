@@ -49,6 +49,12 @@ To optimize admin workflows, the dashboard runs entirely asynchronously without 
 - **AJAX Forms & Button Actions:** Intercepts form submissions and API button clicks (such as clearing dynamic leases, static reservations, or de-authorizing devices) and submits them via background `fetch` requests. Upon completion, a toast message is displayed and the relevant dashboard cards are dynamically updated using a DOMParser wrapper swap.
 - **Collapsible User Sections:** Clicking on any user header row in the "Authorized Local Devices" table expands or collapses the list of devices belonging to that user. The collapsed state is persisted across dashboard updates.
 
+### Dynamic Vault Storage & Probing Backups
+To support massive logs (50+ GB) on secondary drives and prevent SSD wear on the root partition:
+- **Custom Database Path:** Admin can dynamically configure the file path to `vault.db` from the Web Dashboard. Changing the path automatically restarts the backend daemons to apply the setting. Optionally, the `--vault-db` CLI parameter can be supplied to override settings.
+- **Dynamic Drive Space Protection:** Capping (deletion of old log entries) is disabled by default to retain unlimited packet logs. Capping is only triggered as a safety measure (capping to the last 1,000,000 rows) if the drive containing `vault.db` has less than 10% free space remaining.
+- **Self-Healing Writable Backup Probes:** A background thread executes every 3 days to back up the active `vault.db` transaction-safely. It probes candidate mount points (`/logs`, `/mnt/sdc1`, `/mnt/sda6`, `/mnt/sda5`) by performing temporary write tests, selecting the first writable location (preventing failures if a partition like `/mnt/sdc1` is locked in read-only mode).
+
 ---
 
 ## 2. Database Schema
