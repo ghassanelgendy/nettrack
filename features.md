@@ -35,3 +35,7 @@
 ## Customizable Log Storage Settings & Self-Healing Backups
 - **Change:** Configurable vault database location via Web Dashboard settings with automatic service restarts. Implemented a 3-day SQLite backup loop that probes candidate folders (`/logs`, `/mnt/sdc1`, `/mnt/sda6`, `/mnt/sda5`) by writing temporary files to choose the first writeable drive. Added drive space monitor that disables capping unless free space drops below 10%.
 - **Benefit:** Allows storing massive logs on secondary drives safely without risk of root drive partition exhaustion or write failures on locked drives.
+
+## Manual Logs Migration (Move to HDD)
+- **Change:** A dedicated action button on the Web Settings panel allows transferring active `vault.db` to the first writable secondary HDD partition transaction-safely, updating active settings, purging the database from the SSD, and restarting NetTrack.
+- **Benefit:** Instantly frees up SSD disk space on demand while preserving connection histories.
