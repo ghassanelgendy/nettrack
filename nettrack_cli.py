@@ -662,6 +662,81 @@ class WebServerHandler(BaseHTTPRequestHandler):
             self.send_response(303)
             self.send_header("Location", "/")
             self.end_headers()
+        elif self.path == "/settings/migrate_vault":
+            try:
+                dest_dirs = ["/logs", "/mnt/sdc1", "/mnt/sda6", "/mnt/sda5"]
+                target_dir = None
+                for d in dest_dirs:
+                    if os.path.exists(d):
+                        test_file = os.path.join(d, ".write_test")
+                        try:
+                            with open(test_file, "w") as f:
+                                f.write("test")
+                            os.remove(test_file)
+                            target_dir = d
+                            break
+                        except Exception:
+                            continue
+                
+                if not target_dir:
+                    self.send_response(400)
+                    self.end_headers()
+                    self.wfile.write(b"No writeable secondary drive found.")
+                    return
+                
+                old_path = get_vault_db_path()
+                new_path = os.path.join(target_dir, "vault.db")
+                
+                if os.path.abspath(old_path) == os.path.abspath(new_path):
+                    self.send_response(400)
+                    self.end_headers()
+                    self.wfile.write(b"Vault is already on the target drive.")
+                    return
+                
+                if not os.path.exists(old_path):
+                    self.send_response(400)
+                    self.end_headers()
+                    self.wfile.write(b"Active vault.db not found.")
+                    return
+                
+                # Transactional SQLite backup
+                src_conn = sqlite3.connect(old_path)
+                dst_conn = sqlite3.connect(f"file:{new_path}?nolock=1", uri=True)
+                src_conn.backup(dst_conn)
+                dst_conn.close()
+                src_conn.close()
+                
+                # Verify
+                if not os.path.exists(new_path) or os.path.getsize(new_path) == 0:
+                    raise Exception("Migration verification failed: destination file empty.")
+                
+                # Update setting
+                conn = sqlite3.connect(DB_PATH)
+                cursor = conn.cursor()
+                cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('vault_db_path', ?);", (new_path,))
+                conn.commit()
+                conn.close()
+                
+                # Delete the old file from SSD
+                try:
+                    os.remove(old_path)
+                except Exception as e:
+                    print(f"Error removing old vault: {e}")
+                
+                # Restart services in background using docker chroot escape
+                import subprocess
+                subprocess.Popen([
+                    "docker", "run", "--rm", "--privileged", "--net=host", "--pid=host", "-v", "/:/host", "redis:6.2-alpine",
+                    "chroot", "/host", "systemctl", "restart", "nettrack.service", "nettrack-portal.service", "nettrack-web.service", "nettrack-device.service"
+                ])
+                
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(f"Successfully migrated logs to {new_path}".encode("utf-8"))
+            except Exception as e:
+                self.send_response(500)
+                self.end_headers()
+                self.wfile.write(f"Migration failed: {e}".encode("utf-8"))
         else:
             self.send_response(404)
             self.end_headers()
@@ -1605,6 +1680,10 @@ class WebServerHandler(BaseHTTPRequestHandler):
                         </div>
                         <button type="submit" class="btn-submit">Save & Restart Services</button>
                     </form>
+                    <div style="margin-top: 15px; padding-top: 15px; border-top: 1px solid var(--border-color);">
+                        <label style="display:block; font-size:12px; color:rgba(255,255,255,0.6); margin-bottom:8px;">Move active logs from SSD to first writeable HDD partition:</label>
+                        <button onclick="performApiAction('/settings/migrate_vault')" class="btn-submit" style="background:#a855f7;">Migrate Logs to HDD & Free SSD</button>
+                    </div>
                 </div>
 
                 <div class="card" id="distribution-card-container">
