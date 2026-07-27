@@ -1903,7 +1903,7 @@ class WebServerHandler(BaseHTTPRequestHandler):
                 
                 vault_rows_html += f"""
                 <tr>
-                    <td>{timestamp}</td>
+                    <td class="utc-time" data-utc="{timestamp}">{timestamp}</td>
                     <td>
                         <span style="font-weight:bold; color:#fff;">{device_display}</span><br>
                         <span style="font-size:11px; color:#6366f1; font-weight:bold;">Owner: {owner_display}</span>
@@ -1987,7 +1987,7 @@ class WebServerHandler(BaseHTTPRequestHandler):
     </div>
     <div class="container">
         <div class="card">
-            <h2>Real-time Connection Log (Last 200 Packets)</h2>
+            <h2>Real-time Connection Log (Last 200 Packets) - <span id="client-timezone" style="color: #6366f1; font-size: 13px;">Detecting timezone...</span></h2>
             <table>
                 <thead>
                     <tr>
@@ -2004,6 +2004,29 @@ class WebServerHandler(BaseHTTPRequestHandler):
             </table>
         </div>
     </div>
+    <script>
+        const tzName = Intl.DateTimeFormat().resolvedOptions().timeZone;
+        const tzEl = document.getElementById("client-timezone");
+        if (tzEl) tzEl.textContent = "Local Time: " + tzName;
+
+        document.querySelectorAll(".utc-time").forEach(el => {{
+            const utcStr = el.getAttribute("data-utc");
+            if (utcStr) {{
+                const date = new Date(utcStr + " UTC");
+                if (!isNaN(date.getTime())) {{
+                    el.textContent = date.toLocaleString('en-US', {{
+                        year: 'numeric',
+                        month: 'short',
+                        day: 'numeric',
+                        hour: 'numeric',
+                        minute: '2-digit',
+                        second: '2-digit',
+                        hour12: true
+                    }});
+                }}
+            }}
+        }});
+    </script>
 </body>
 </html>"""
         self.wfile.write(html.encode("utf-8"))
