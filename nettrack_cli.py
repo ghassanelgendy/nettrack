@@ -228,13 +228,13 @@ class WebServerHandler(BaseHTTPRequestHandler):
                 SELECT 
                     rd.username,
                     COALESCE(u.daily_limit_bytes, ug.daily_limit_bytes) AS d_limit,
-                    COALESCE((SELECT SUM(du.sent_bytes + du.received_bytes) FROM device_usage du WHERE du.mac_address = rd.mac_address AND du.timestamp >= ?), 0) AS daily_used,
-                    COALESCE((SELECT SUM(du.sent_bytes + du.received_bytes) FROM device_usage du WHERE du.mac_address = rd.mac_address AND du.timestamp >= ?), 0) AS monthly_used,
-                    EXISTS(SELECT 1 FROM quota_bypasses WHERE mac_address = rd.mac_address) AS warning_bypassed
+                    COALESCE((SELECT SUM(du.sent_bytes + du.received_bytes) FROM device_usage du WHERE LOWER(du.mac_address) = LOWER(rd.mac_address) AND du.timestamp >= ?), 0) AS daily_used,
+                    COALESCE((SELECT SUM(du.sent_bytes + du.received_bytes) FROM device_usage du WHERE LOWER(du.mac_address) = LOWER(rd.mac_address) AND du.timestamp >= ?), 0) AS monthly_used,
+                    EXISTS(SELECT 1 FROM quota_bypasses WHERE LOWER(mac_address) = LOWER(rd.mac_address)) AS warning_bypassed
                 FROM registered_devices rd
                 JOIN users u ON rd.username = u.username
                 LEFT JOIN user_groups ug ON u.group_id = ug.id
-                WHERE rd.mac_address = ?;
+                WHERE LOWER(rd.mac_address) = LOWER(?);
             """, (today_start, month_start, mac))
             row = cursor.fetchone()
             conn.close()
