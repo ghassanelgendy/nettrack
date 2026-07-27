@@ -309,8 +309,8 @@ def flush_vault():
             conn = sqlite3.connect(vault_db_path)
             cursor = conn.cursor()
             cursor.executemany("""
-                INSERT INTO raw_traffic (src_mac, src_ip, dst_mac, dst_ip, bytes)
-                VALUES (?, ?, ?, ?, ?);
+                INSERT INTO raw_traffic (timestamp, src_mac, src_ip, dst_mac, dst_ip, bytes)
+                VALUES (?, ?, ?, ?, ?, ?);
             """, to_flush)
             
             # If disk free space is low (< 10%), cap raw_traffic table to prevent disk exhaustion.
@@ -386,9 +386,10 @@ def parse_tcpdump(iface):
                             stats_accumulator[key]['received'] += pkt_len
 
                 # Log to vault
+                ts = time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime())
                 with vault_lock:
                     if len(vault_accumulator) < 5000:
-                        vault_accumulator.append((src_mac, src_ip, dst_mac, dst_ip, pkt_len))
+                        vault_accumulator.append((ts, src_mac, src_ip, dst_mac, dst_ip, pkt_len))
             except Exception:
                 continue
     except KeyboardInterrupt:
