@@ -26,7 +26,7 @@ The bandwidth tracking daemon (`nettrack.service`) uses `nethogs` to capture per
 - Warning bypasses expire and are auto-pruned after 24 hours.
 
 ### Billing Cycle Realignment (Starts on 28th)
-Monthly quotas and consolidated group usage calculations do not follow calendar months. Instead, they align to a custom cycle starting on the **28th day** of each month.
+Monthly quotas and consolidated group usage calculations do not follow calendar months. Instead, they align to a custom cycle starting on the **28th day** of each month and running till the day before the rollover of the next month (from the 28th to the 27th).
 - If today's date is $\ge 28$, the cycle starts on the 28th of the current month.
 - If today's date is $< 28$, the cycle starts on the 28th of the previous month.
 
