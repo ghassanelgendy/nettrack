@@ -44,6 +44,7 @@ def init_database():
         ip_address TEXT NOT NULL,
         username TEXT NOT NULL,
         device_name TEXT,
+        last_seen TIMESTAMP,
         registered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (username) REFERENCES users(username) ON DELETE CASCADE
     );
@@ -85,6 +86,11 @@ def init_database():
                 cursor.execute("ALTER TABLE users ADD COLUMN suggested_daily_limit_bytes INTEGER DEFAULT NULL;")
             if 'suggested_monthly_limit_bytes' not in columns:
                 cursor.execute("ALTER TABLE users ADD COLUMN suggested_monthly_limit_bytes INTEGER DEFAULT NULL;")
+                
+        cursor.execute("PRAGMA table_info(registered_devices);")
+        rd_columns = [row[1] for row in cursor.fetchall()]
+        if rd_columns and 'last_seen' not in rd_columns:
+            cursor.execute("ALTER TABLE registered_devices ADD COLUMN last_seen TIMESTAMP;")
     except Exception as e:
         print(f"[db] Migration check warning: {e}")
     
