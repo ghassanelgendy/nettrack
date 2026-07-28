@@ -7,6 +7,7 @@ import subprocess
 import threading
 import argparse
 import shutil
+import resource
 
 DB_PATH = "/var/lib/nettrack/nettrack.db"
 
@@ -154,8 +155,27 @@ def init_vault_db():
     try:
         vault_db_path = get_vault_db_path()
         os.makedirs(os.path.dirname(os.path.abspath(vault_db_path)), exist_ok=True)
-        conn = sqlite3.connect(vault_db_path)
+        
+        # Auto-migration fallback on daemon startup
+        default_path = "/var/lib/nettrack/vault.db"
+        if os.path.abspath(vault_db_path) != os.path.abspath(default_path):
+            if os.path.exists(default_path) and not os.path.exists(vault_db_path):
+                print(f"[device] Auto-migrating vault database from {default_path} to {vault_db_path} on startup...")
+                try:
+                    src_conn = sqlite3.connect(default_path)
+                    dst_conn = sqlite3.connect(f"file:{vault_db_path}?nolock=1", uri=True)
+                    src_conn.backup(dst_conn)
+                    dst_conn.close()
+                    src_conn.close()
+                    os.remove(default_path)
+                    print("[device] Auto-migration completed successfully.")
+                except Exception as ex:
+                    print(f"[device] Auto-migration error: {ex}", file=sys.stderr, flush=True)
+
+        conn = sqlite3.connect(vault_db_path, timeout=10)
         cursor = conn.cursor()
+        # Enable WAL mode for concurrent read/write access across processes
+        cursor.execute("PRAGMA journal_mode=WAL;")
         cursor.execute("""
         CREATE TABLE IF NOT EXISTS raw_traffic (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -171,6 +191,19 @@ def init_vault_db():
         conn.close()
     except Exception as e:
         print(f"[device] Error initializing vault db: {e}", file=sys.stderr, flush=True)
+
+def _memory_watchdog(limit_mb=400, check_interval=60):
+    import signal
+    limit_bytes = limit_mb * 1024 * 1024
+    while True:
+        time.sleep(check_interval)
+        try:
+            usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
+            if usage > limit_bytes:
+                print(f"[device] Memory watchdog: RSS {usage // 1024 // 1024}MB > {limit_mb}MB limit — restarting cleanly", flush=True)
+                os.kill(os.getpid(), signal.SIGTERM)
+        except Exception:
+            pass
 
 def parse_iptables_counters():
     global iptables_last_seen, stats_accumulator
@@ -263,6 +296,7 @@ def flush_stats():
             
             # Current hour timestamp for aggregate
             hour_ts = time.strftime("%Y-%m-%d %H:00:00", time.gmtime())
+            now_ts = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
             
             for (mac, ip), bytes_data in to_flush.items():
                 sent = bytes_data['sent']
@@ -288,6 +322,13 @@ def flush_stats():
                     INSERT INTO device_usage (mac_address, ip_address, timestamp, sent_bytes, received_bytes)
                     VALUES (?, ?, ?, ?, ?);
                     """, (mac, ip, hour_ts, sent, recv))
+                
+                # Update last_seen in registered_devices
+                cursor.execute("""
+                UPDATE registered_devices
+                SET last_seen = ?
+                WHERE LOWER(mac_address) = LOWER(?);
+                """, (now_ts, mac))
             
             conn.commit()
             conn.close()
@@ -306,7 +347,7 @@ def flush_vault():
 
         try:
             vault_db_path = get_vault_db_path()
-            conn = sqlite3.connect(vault_db_path)
+            conn = sqlite3.connect(vault_db_path, timeout=10)
             cursor = conn.cursor()
             cursor.executemany("""
                 INSERT INTO raw_traffic (timestamp, src_mac, src_ip, dst_mac, dst_ip, bytes)
@@ -413,6 +454,9 @@ def main():
     threading.Thread(target=flush_vault, daemon=True).start()
     threading.Thread(target=iptables_accounting_loop, daemon=True).start()
     threading.Thread(target=scheduled_backup_loop, daemon=True).start()
+    
+    # Start memory watchdog
+    threading.Thread(target=_memory_watchdog, args=(400, 60), daemon=True).start()
     
     # Trigger initial backup if none exists in settings
     try:

@@ -4,6 +4,7 @@ import sys
 import time
 import sqlite3
 import subprocess
+import signal
 
 DB_PATH = "/var/lib/nettrack/nettrack.db"
 PORT = 6054
@@ -79,17 +80,71 @@ def init_firewall():
 
 last_allowed_ips = set()
 
+def get_billing_cycle_day():
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT value FROM settings WHERE key = 'billing_cycle_day';")
+        row = cursor.fetchone()
+        conn.close()
+        if row and row[0]:
+            return int(row[0])
+    except Exception:
+        pass
+    return 28
+
+def get_local_midnight_in_utc():
+    import datetime
+    now_local = datetime.datetime.now()
+    if now_local.tzinfo is not None:
+        local_midnight = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+        utc_midnight = local_midnight.astimezone(datetime.timezone.utc)
+    else:
+        local_midnight = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+        local_midnight_tz = local_midnight.astimezone()
+        utc_midnight = local_midnight_tz.astimezone(datetime.timezone.utc)
+    return utc_midnight.strftime('%Y-%m-%d %H:%M:%S')
+
 def get_billing_start():
     import datetime
-    today = datetime.date.today()
-    if today.day >= 28:
-        start_date = today.replace(day=28)
+    cycle_day = get_billing_cycle_day()
+    
+    # Get current local date
+    now_local = datetime.datetime.now()
+    today = now_local.date()
+    
+    def get_last_day_of_month(year, month):
+        if month == 12:
+            return 31
+        return (datetime.date(year, month + 1, 1) - datetime.timedelta(days=1)).day
+        
+    def get_valid_day(year, month, target_day):
+        last_day = get_last_day_of_month(year, month)
+        return min(target_day, last_day)
+
+    current_threshold_day = get_valid_day(today.year, today.month, cycle_day)
+    
+    if today.day >= current_threshold_day:
+        start_date = today.replace(day=current_threshold_day)
     else:
         if today.month == 1:
-            start_date = today.replace(year=today.year - 1, month=12, day=28)
+            prev_year = today.year - 1
+            prev_month = 12
         else:
-            start_date = today.replace(month=today.month - 1, day=28)
-    return start_date.strftime('%Y-%m-%d 00:00:00')
+            prev_year = today.year
+            prev_month = today.month - 1
+        prev_threshold_day = get_valid_day(prev_year, prev_month, cycle_day)
+        start_date = datetime.date(prev_year, prev_month, prev_threshold_day)
+        
+    local_start_dt = datetime.datetime.combine(start_date, datetime.time.min)
+    if now_local.tzinfo is not None:
+        local_start_dt = local_start_dt.replace(tzinfo=now_local.tzinfo)
+        utc_start_dt = local_start_dt.astimezone(datetime.timezone.utc)
+    else:
+        local_start_dt_tz = local_start_dt.astimezone()
+        utc_start_dt = local_start_dt_tz.astimezone(datetime.timezone.utc)
+        
+    return utc_start_dt.strftime('%Y-%m-%d %H:%M:%S')
 
 def get_effective_user_limits():
     try:
@@ -169,17 +224,33 @@ def update_allowed_ips():
         cursor.execute("DELETE FROM quota_bypasses WHERE bypassed_at < datetime('now', '-1 day');")
         conn.commit()
         
-        today_start = datetime.date.today().strftime('%Y-%m-%d 00:00:00')
+        today_start = get_local_midnight_in_utc()
         month_start = get_billing_start()
         
-        # Get all registered devices along with their usage and daily limits
+        # Get all registered devices along with their username's aggregated usage and daily limits
         cursor.execute("""
             SELECT 
                 rd.ip_address,
                 rd.username,
                 COALESCE(u.daily_limit_bytes, ug.daily_limit_bytes) AS d_limit,
-                COALESCE((SELECT SUM(du.sent_bytes + du.received_bytes) FROM device_usage du WHERE LOWER(du.mac_address) = LOWER(rd.mac_address) AND du.timestamp >= ?), 0) AS d_used,
-                COALESCE((SELECT SUM(du.sent_bytes + du.received_bytes) FROM device_usage du WHERE LOWER(du.mac_address) = LOWER(rd.mac_address) AND du.timestamp >= ?), 0) AS m_used,
+                COALESCE((
+                    SELECT SUM(du.sent_bytes + du.received_bytes) 
+                    FROM device_usage du 
+                    WHERE LOWER(du.mac_address) IN (
+                        SELECT LOWER(mac_address) 
+                        FROM registered_devices 
+                        WHERE LOWER(username) = LOWER(rd.username)
+                    ) AND du.timestamp >= ?
+                ), 0) AS d_used,
+                COALESCE((
+                    SELECT SUM(du.sent_bytes + du.received_bytes) 
+                    FROM device_usage du 
+                    WHERE LOWER(du.mac_address) IN (
+                        SELECT LOWER(mac_address) 
+                        FROM registered_devices 
+                        WHERE LOWER(username) = LOWER(rd.username)
+                    ) AND du.timestamp >= ?
+                ), 0) AS m_used,
                 EXISTS(SELECT 1 FROM quota_bypasses WHERE LOWER(mac_address) = LOWER(rd.mac_address)) AS warning_bypassed
             FROM registered_devices rd
             JOIN users u ON rd.username = u.username
@@ -261,6 +332,13 @@ def main():
         init_db.init_database()
         
     init_firewall()
+    
+    # Register SIGUSR1 handler for immediate updates
+    def handle_sigusr1(signum, frame):
+        print("[portal] Received SIGUSR1. Syncing rules immediately...", flush=True)
+        update_allowed_ips()
+        
+    signal.signal(signal.SIGUSR1, handle_sigusr1)
     
     try:
         while True:
